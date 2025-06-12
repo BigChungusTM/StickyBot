@@ -285,6 +285,3 @@ Common issues and solutions:
 - **Missing candles**: Verify network connectivity and API rate limits
 - **Invalid orders**: Ensure sufficient balance and correct trading pair
 - **Position tracking issues**: Check trade history and account balance
-
-## License
-Proprietary - All rights reserved
