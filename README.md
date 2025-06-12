@@ -90,6 +90,22 @@ buyConfig: {
 }
 ```
 
+## API Reference
+
+This project includes API reference documentation from the `coinbase-api` NPM package in the `refdocs` directory. These documents provide detailed information about the available API endpoints and their usage.
+
+### Available Reference Documents
+- `coinbase.service.md`: Documentation for the Coinbase service wrapper
+- `rest-client.md`: REST client implementation details
+- `types.md`: TypeScript type definitions
+- `websocket-client.md`: WebSocket client documentation
+
+These reference documents are automatically generated from the `coinbase-api` package and can be useful when:
+- Implementing new API calls
+- Debugging API-related issues
+- Understanding the available methods and their parameters
+- Working with WebSocket connections
+
 ## Trading Strategy
 
 ### Buy Signal Generation (21-point System)
