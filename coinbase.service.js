@@ -339,22 +339,24 @@ class CoinbaseService {
     const sizeStr = size.toString();
     
     if (orderTypeLower === 'market') {
-      if (sideUpper === 'BUY') {
-        // For market buy, size is the amount of quote currency to spend (e.g., USDC)
+      // For market orders, we need to structure the order configuration differently
+      // based on whether we're specifying base_size or quote_size
+      if (sideType === 'quote_size' || (sideUpper === 'BUY' && sideType !== 'base_size')) {
+        // For market buy with quote_size (spending a specific amount of quote currency)
         orderConfiguration = {
           market_market_ioc: {
-            quote_size: sizeStr,
+            quote_size: sizeStr
           }
         };
-      } else if (sideUpper === 'SELL') {
-        // For market sell, size is the amount of base currency to sell (e.g., SYRUP)
+      } else if (sideType === 'base_size' || sideUpper === 'SELL') {
+        // For market sell with base_size (selling a specific amount of base currency)
         orderConfiguration = {
           market_market_ioc: {
-            base_size: sizeStr,
+            base_size: sizeStr
           }
         };
       } else {
-        throw new Error('Invalid side for market order. Must be BUY or SELL.');
+        throw new Error('Invalid sideType for market order. Must be "base_size" or "quote_size".');
       }
     } else if (orderTypeLower === 'limit') {
       if (!price) throw new Error('Limit orders require a price');

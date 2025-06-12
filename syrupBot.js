@@ -210,18 +210,17 @@ const logger = winston.createLogger({
       ),
       maxsize: 10 * 1024 * 1024, // 10MB
       maxFiles: 30, // Keep 30 days of trade cycle logs
-      tailable: true
     })
   ]
 });
 
-// Configuration
+// Configuration with environment variable fallbacks
 const config = {
   apiKey: process.env.COINBASE_API_KEY || '',
   apiSecret: process.env.COINBASE_API_SECRET || '',
-  tradingPair: 'SYRUP-USDC',
-  baseCurrency: 'SYRUP',
-  quoteCurrency: 'USDC',
+  tradingPair: process.env.TRADING_PAIR || 'SYRUP-USDC',
+  baseCurrency: process.env.BASE_CURRENCY || 'SYRUP',
+  quoteCurrency: process.env.QUOTE_CURRENCY || 'USDC',
   currencySymbol: '$',
   candleInterval: 'ONE_MINUTE',
   candleLimit: 60, // 60 minutes of 1-minute candles
@@ -229,22 +228,39 @@ const config = {
   cacheFile: CACHE_FILE,
   // Technical indicator periods
   indicators: {
-    ema: { period: 20 },
-    rsi: { period: 14 },
-    stoch: { period: 14, signal: 3, kPeriod: 3 },
-    bb: { period: 20, stdDev: 2 },
+    ema: { period: parseInt(process.env.EMA_PERIOD, 10) || 20 },
+    rsi: { period: parseInt(process.env.RSI_PERIOD, 10) || 14 },
+    stoch: { period: parseInt(process.env.STOCH_PERIOD, 10) || 14, signal: parseInt(process.env.STOCH_SIGNAL, 10) || 3, kPeriod: parseInt(process.env.STOCH_K_PERIOD, 10) || 3 },
+    bb: { period: parseInt(process.env.BB_PERIOD, 10) || 20, stdDev: parseInt(process.env.BB_STD_DEV, 10) || 2 },
     macd: { 
-      fastPeriod: 12, 
-      slowPeriod: 26, 
-      signalPeriod: 9 
+      fastPeriod: parseInt(process.env.MACD_FAST_PERIOD, 10) || 12, 
+      slowPeriod: parseInt(process.env.MACD_SLOW_PERIOD, 10) || 26, 
+      signalPeriod: parseInt(process.env.MACD_SIGNAL_PERIOD, 10) || 9 
     }
   }
 };
 
-// Load environment variables
-dotenv.config();
-
-// Debug log environment variables
+// Log trading configuration
+console.log('=== Trading Configuration ===');
+console.log(`Trading Pair: ${config.tradingPair}`);
+console.log(`Base Currency: ${config.baseCurrency}`);
+console.log(`Quote Currency: ${config.quoteCurrency}`);
+console.log(`Currency Symbol: ${config.currencySymbol}`);
+console.log(`Candle Interval: ${config.candleInterval}`);
+console.log(`Candle Limit: ${config.candleLimit}`);
+console.log(`Max Cache Size: ${config.maxCacheSize}`);
+console.log(`Cache File: ${config.cacheFile}`);
+console.log(`Indicators:`);
+console.log(`  EMA Period: ${config.indicators.ema.period}`);
+console.log(`  RSI Period: ${config.indicators.rsi.period}`);
+console.log(`  Stochastic Period: ${config.indicators.stoch.period}`);
+console.log(`  Stochastic Signal: ${config.indicators.stoch.signal}`);
+console.log(`  Stochastic K Period: ${config.indicators.stoch.kPeriod}`);
+console.log(`  Bollinger Bands Period: ${config.indicators.bb.period}`);
+console.log(`  Bollinger Bands Std Dev: ${config.indicators.bb.stdDev}`);
+console.log(`  MACD Fast Period: ${config.indicators.macd.fastPeriod}`);
+console.log(`  MACD Slow Period: ${config.indicators.macd.slowPeriod}`);
+console.log(`  MACD Signal Period: ${config.indicators.macd.signalPeriod}`);
 console.log('=== Environment Variables ===');
 console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
 console.log('COINBASE_API_KEY_ID:', process.env.COINBASE_API_KEY_ID ? '*** (set)' : 'not set');
@@ -1742,6 +1758,37 @@ class SyrupTradingBot {
     const maxPossibleScore = 21; // 8 (tech) + 3 (dip) + 10 (24h low)
     const totalScore = Math.min(maxPossibleScore, techScore.score + dipScore.score + low24hScore.score);
     
+    // Log the score calculation with detailed breakdown
+    logger.debug('Buy signal score calculation', {
+      timestamp: currentTime.toISOString(),
+      techScore: {
+        value: techScore.score,
+        max: 8,
+        reasons: techScore.reasons
+      },
+      dipScore: {
+        value: dipScore.score,
+        max: 3,
+        reasons: dipScore.reasons
+      },
+      low24hScore: {
+        value: low24hScore.score,
+        max: 10,
+        low24h: low24hScore.low24h,
+        currentPrice: currentPrice,
+        percentAbove24hLow: low24hScore.percentAbove24hLow
+      },
+      totalScore: {
+        value: totalScore,
+        max: 21,
+        minRequired: this.buyConfig.minScore,
+        meetsThreshold: totalScore >= this.buyConfig.minScore
+      },
+      price: currentPrice,
+      hasActiveSignal: this.activeBuySignal.isActive,
+      activeSignalConfirmations: this.activeBuySignal.confirmations
+    });
+    
     // Log detailed score information
     logger.debug('Buy signal scores:', {
       techScore: techScore.score,
@@ -1792,31 +1839,54 @@ class SyrupTradingBot {
         return cancelledSignal;
       }
       
-      // If we have an active signal but the total score dropped below threshold, reset it
-      // Only reset if the score is below the minimum threshold (e.g., 11/21)
-      if (totalScore < this.buyConfig.minScore) {
-        logger.info('Resetting active signal due to total score below threshold', {
-          currentTotalScore: totalScore,
-          minRequired: this.buyConfig.minScore,
-          techScore: techScore.score,
-          dipScore: dipScore.score,
-          low24hScore: low24hScore.score,
-          confirmations: this.activeBuySignal.confirmations
-        });
-        this.activeBuySignal = {
-          isActive: false,
-          signalPrice: null,
-          signalTime: null,
-          confirmations: 0,
-          lastConfirmationTime: null
-        };
-      } else {
-        // Log that we're keeping the signal active due to high score
-        logger.debug('Maintaining active signal - score remains above threshold', {
-          currentTotalScore: totalScore,
-          minRequired: this.buyConfig.minScore,
-          confirmations: this.activeBuySignal.confirmations
-        });
+      // Log the current score components for debugging
+      logger.debug('Signal score evaluation:', {
+        totalScore,
+        techScore: techScore.score,
+        dipScore: dipScore.score,
+        low24hScore: low24hScore.score,
+        minRequired: this.buyConfig.minScore,
+        confirmations: this.activeBuySignal.confirmations,
+        isActive: this.activeBuySignal.isActive,
+        signalPrice: this.activeBuySignal.signalPrice,
+        currentPrice
+      });
+
+      // Only check for reset if we have an active signal
+      if (this.activeBuySignal.isActive) {
+        // If we have an active signal but the total score dropped below threshold, reset it
+        // Only reset if the score is below the minimum threshold (e.g., 11/21)
+        if (totalScore < this.buyConfig.minScore) {
+          logger.info('Resetting active signal due to total score below threshold', {
+            currentTotalScore: totalScore,
+            minRequired: this.buyConfig.minScore,
+            techScore: techScore.score,
+            dipScore: dipScore.score,
+            low24hScore: low24hScore.score,
+            confirmations: this.activeBuySignal.confirmations,
+            signalPrice: this.activeBuySignal.signalPrice,
+            currentPrice,
+            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%'
+          });
+          
+          this.activeBuySignal = {
+            isActive: false,
+            signalPrice: null,
+            signalTime: null,
+            confirmations: 0,
+            lastConfirmationTime: null
+          };
+        } else {
+          // Log that we're keeping the signal active due to high score
+          logger.debug('Maintaining active signal - score remains above threshold', {
+            currentTotalScore: totalScore,
+            minRequired: this.buyConfig.minScore,
+            confirmations: this.activeBuySignal.confirmations,
+            signalPrice: this.activeBuySignal.signalPrice,
+            currentPrice,
+            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%'
+          });
+        }
       }
     }
     
@@ -2320,14 +2390,34 @@ class SyrupTradingBot {
       // 4. Place the market order using the coinbase service
       let orderResponse;
       try {
+        // Ensure trading pair is in the correct format (uppercase with hyphen)
+        const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
+        
+        // Log the trading pair and order details for debugging
+        logger.info(`${orderLabel} Order details - ` +
+          `Trading Pair: ${formattedTradingPair}, ` +
+          `Base: ${this.baseCurrency}, ` +
+          `Quote: ${this.quoteCurrency}, ` +
+          `Side: BUY, ` +
+          `Side Type: quote_size, ` +
+          `Size: ${positionSize} ${this.quoteCurrency}, ` +
+          `Order Type: market`);
+          
+        // Validate trading pair format
+        if (!formattedTradingPair.includes('-') || 
+            !formattedTradingPair.endsWith(this.quoteCurrency)) {
+          throw new Error(`Invalid trading pair format: ${formattedTradingPair}. ` +
+            `Expected format: BASE-${this.quoteCurrency}`);
+        }
+        
         // For market buy, we need to specify the amount of quote currency (USDC) to spend
         // The size parameter should be the amount of USDC to spend
         orderResponse = await coinbaseService.submitOrder(
-          this.tradingPair,  // productId
-          'BUY',             // side
-          'quote_size',      // sideType - indicates the size is in quote currency (USDC)
+          formattedTradingPair,  // productId - ensure correct format
+          'BUY',                 // side
+          'quote_size',          // sideType - indicates the size is in quote currency (USDC)
           positionSize.toString(),  // size - amount of USDC to spend
-          'market'           // orderType
+          'market'               // orderType
         );
         
         if (!orderResponse?.order_id) {
