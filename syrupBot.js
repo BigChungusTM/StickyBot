@@ -1,0 +1,2859 @@
+import { CBAdvancedTradeClient } from 'coinbase-api';
+import dotenv from 'dotenv';
+import winston from 'winston';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { promises as fs } from 'fs';
+import * as fsSync from 'fs';
+import axios from 'axios';
+import { 
+  SMA, EMA, RSI, Stochastic, BollingerBands, MACD 
+} from 'technicalindicators';
+import { setTimeout as sleep } from 'timers/promises';
+
+// Timestamp utility functions
+const parseTimestamp = (timestamp) => {
+  if (timestamp === undefined || timestamp === null) {
+    logger.warn('Received undefined or null timestamp');
+    return null;
+  }
+  
+  try {
+    // If it's already a number, assume it's a Unix timestamp
+    if (typeof timestamp === 'number') {
+      // If it's in milliseconds, convert to seconds
+      return timestamp > 1e12 ? Math.floor(timestamp / 1000) : timestamp;
+    }
+    
+    // If it's a string that can be parsed as a number
+    if (typeof timestamp === 'string') {
+      // Check if it's a numeric string
+      if (/^\d+$/.test(timestamp)) {
+        const num = parseInt(timestamp, 10);
+        return num > 1e12 ? Math.floor(num / 1000) : num;
+      }
+      
+      // Handle ISO 8601 format with timezone
+      if (timestamp.includes('T') && timestamp.includes('Z')) {
+        const date = new Date(timestamp);
+        if (!isNaN(date.getTime())) {
+          return Math.floor(date.getTime() / 1000);
+        }
+      }
+      
+      // Handle other date string formats
+      const date = new Date(timestamp);
+      if (!isNaN(date.getTime())) {
+        return Math.floor(date.getTime() / 1000);
+      }
+    }
+    
+    // If it's an object with getTime method (Date object)
+    if (typeof timestamp === 'object' && typeof timestamp.getTime === 'function') {
+      return Math.floor(timestamp.getTime() / 1000);
+    }
+    
+    logger.warn('Could not parse timestamp:', { 
+      timestamp, 
+      type: typeof timestamp,
+      constructor: timestamp?.constructor?.name 
+    });
+    return null;
+  } catch (error) {
+    logger.error('Error parsing timestamp:', { 
+      timestamp, 
+      error: error.message,
+      stack: error.stack 
+    });
+    return null;
+  }
+};
+
+// Process and validate a single candle
+const processCandle = (candle) => {
+  try {
+    if (!candle) {
+      logger.warn('Skipping null/undefined candle');
+      return null;
+    }
+
+    // Handle different candle formats
+    let candleData;
+    if (candle.candle) {
+      // Format: { candle: { ... }, timestamp: 'ISO string' }
+      candleData = {
+        ...candle.candle,
+        time: candle.timestamp || candle.candle.time
+      };
+    } else if (candle.start) {
+      // Format: { start: timestamp, open: ..., high: ..., low: ..., close: ..., volume: ... }
+      candleData = {
+        ...candle,
+        time: candle.start
+      };
+    } else {
+      // Assume direct candle format
+      candleData = { ...candle };
+    }
+
+    // Validate required fields
+    const requiredFields = ['time', 'open', 'high', 'low', 'close', 'volume'];
+    for (const field of requiredFields) {
+      if (candleData[field] === undefined) {
+        logger.warn(`Skipping candle with missing field: ${field}`, { candle });
+        return null;
+      }
+    }
+
+    // Parse timestamp (handle both seconds and milliseconds)
+    const time = parseTimestamp(candleData.time);
+    if (isNaN(time) || time <= 0) {
+      logger.warn('Skipping candle with invalid timestamp:', { 
+        time: candleData.time,
+        parsedTime: time,
+        type: typeof candleData.time
+      });
+      return null;
+    }
+
+    // Convert all numeric fields to numbers
+    const numericFields = ['open', 'high', 'low', 'close', 'volume'];
+    const processedCandle = { time };
+    
+    for (const field of numericFields) {
+      const value = parseFloat(candleData[field]);
+      if (isNaN(value) || value < 0) {
+        logger.warn(`Skipping candle with invalid ${field}:`, { 
+          field, 
+          value: candleData[field],
+          type: typeof candleData[field]
+        });
+        return null;
+      }
+      processedCandle[field] = value;
+    }
+
+    return processedCandle;
+  } catch (error) {
+    logger.error('Error processing candle:', error, { 
+      candle: JSON.stringify(candle).substring(0, 200) 
+    });
+    return null;
+  }
+};
+
+// Format timestamp for display
+const formatTimestamp = (timestamp) => {
+  if (!timestamp) return 'N/A';
+  // Convert from seconds to milliseconds if needed
+  const date = new Date(timestamp * 1000);
+  return date.toISOString();
+};
+
+// Get directory name in ES module
+const scriptPath = fileURLToPath(import.meta.url);
+const scriptDir = path.dirname(scriptPath);
+const CACHE_FILE = path.join(scriptDir, 'candle_cache.json');
+const MAX_CANDLES = 10080; // 1 week of 1-minute candles (60*24*7)
+
+// Load environment variables
+dotenv.config();
+
+// Get directory name in ES module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ensure logs directory exists
+const logsDir = path.join(scriptDir, 'logs');
+if (!fsSync.existsSync(logsDir)) {
+  fsSync.mkdirSync(logsDir, { recursive: true });
+}
+
+// Configure logger
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    // Console transport - exclude TRADE_CYCLE logs
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple(),
+        winston.format((info) => {
+          // Filter out TRADE_CYCLE logs from console
+          if (info.message === 'TRADE_CYCLE' || info.message === 'TRADE_EXECUTED') {
+            return false;
+          }
+          return info;
+        })()
+      )
+    }),
+    // Daily file transport for all logs
+    new winston.transports.File({
+      filename: path.join(logsDir, 'syrup-bot-combined.log'),
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 7, // Keep 7 days of logs
+      tailable: true
+    }),
+    // Separate file for trade cycle data
+    new winston.transports.File({
+      filename: path.join(logsDir, 'trade-cycle.log'),
+      level: 'info',
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.printf(({ timestamp, message, ...meta }) => {
+          return `${timestamp} - ${message}`;
+        })
+      ),
+      maxsize: 10 * 1024 * 1024, // 10MB
+      maxFiles: 30, // Keep 30 days of trade cycle logs
+      tailable: true
+    })
+  ]
+});
+
+// Configuration
+const config = {
+  apiKey: process.env.COINBASE_API_KEY || '',
+  apiSecret: process.env.COINBASE_API_SECRET || '',
+  tradingPair: 'SYRUP-USDC',
+  baseCurrency: 'SYRUP',
+  quoteCurrency: 'USDC',
+  currencySymbol: '$',
+  candleInterval: 'ONE_MINUTE',
+  candleLimit: 60, // 60 minutes of 1-minute candles
+  maxCacheSize: MAX_CANDLES,
+  cacheFile: CACHE_FILE,
+  // Technical indicator periods
+  indicators: {
+    ema: { period: 20 },
+    rsi: { period: 14 },
+    stoch: { period: 14, signal: 3, kPeriod: 3 },
+    bb: { period: 20, stdDev: 2 },
+    macd: { 
+      fastPeriod: 12, 
+      slowPeriod: 26, 
+      signalPeriod: 9 
+    }
+  }
+};
+
+// Initialize Coinbase Advanced Trade client
+const client = new CBAdvancedTradeClient(
+  {
+    // API credentials from environment variables
+    apiKey: process.env.COINBASE_API_KEY || '',
+    apiSecret: process.env.COINBASE_API_SECRET || '',
+    // Optional: Set to true to use the sandbox environment
+    // sandbox: process.env.NODE_ENV !== 'production'
+  },
+  {
+    // Optional: Axios request config
+    timeout: 5000,
+    headers: {
+      'User-Agent': 'SYRUP-USDC-Trader/1.0'
+    }
+  }
+);
+
+class SyrupTradingBot {
+  constructor() {
+    this.client = client;
+    this.tradingPair = config.tradingPair;
+    this.baseCurrency = config.baseCurrency;
+    this.quoteCurrency = config.quoteCurrency;
+    this.currencySymbol = config.currencySymbol;
+    this.accounts = {};
+    this.candles = [];
+    this.hourlyCandles = []; // Store hourly candles for 24h low calculation
+    this.lastHourlyCandleUpdate = 0;
+    this.indicators = {};
+    this.isRunning = false;
+    this._isFetching = false;
+    this._isBackfilling = false;
+    this._lastFetchTime = 0;
+    this.lastManualBuyCheck = 0;
+    this.manualBuyCheckInterval = 5 * 60 * 1000; // Check for manual buys every 5 minutes
+    
+    // Buy scoring configuration
+    this.buyConfig = {
+      minScore: 11,  // Minimum score out of 21 to consider a buy (7 tech + 3 dip + 11 24h low)
+      rsiOversold: 30,
+      rsiOverbought: 70,
+      stochOversold: 20,
+      stochOverbought: 80,
+      bbPeriod: 20,
+      bbStdDev: 2,
+      emaFastPeriod: 9,
+      emaSlowPeriod: 21,
+      emaVerySlowPeriod: 200,
+      macdFastPeriod: 12,
+      macdSlowPeriod: 26,
+      macdSignalPeriod: 9,
+      stochPeriod: 14,
+      stochKPeriod: 3,
+      stochDPeriod: 3,
+      volumeSpikeMultiplier: 1.5,
+      minDipPercent: 1.5,  // 1.5% below 60-min high
+      maxDipPercent: 4.0,  // 4% below 60-min high
+      minPositionSize: 7,     // Minimum position size in quote currency (7 USDC)
+      positionSizePercent: 20, // Percentage of available balance to use per buy
+      maxDollarCostAveraging: 3, // Maximum number of times to DCA into a position
+      // 24h low scoring configuration - points based on % above 24h low
+      low24hScoreRanges: [
+        { maxPercent: 1.0, score: 10 },   // 0-1% above 24h low: 10 points
+        { maxPercent: 2.0, score: 8 },    // 1-2% above 24h low: 8 points
+        { maxPercent: 3.0, score: 6 },    // 2-3% above 24h low: 6 points
+        { maxPercent: 4.0, score: 4 },    // 3-4% above 24h low: 4 points
+        { maxPercent: 5.0, score: 2 },    // 4-5% above 24h low: 2 points
+        { maxPercent: Infinity, score: 0 } // >5% above 24h low: 0 points
+      ]
+    };
+    
+    // Track buy signals for 2-candle confirmation
+    this.pendingBuySignals = [];
+    this.lastBuyScore = 0;
+    
+    // Track active buy signal state
+    this.activeBuySignal = {
+      isActive: false,          // Whether there's an active buy signal
+      signalPrice: null,        // Price when signal was first triggered
+      signalTime: null,         // Timestamp when signal was first triggered
+      confirmations: 0,         // Number of confirmations received
+      lastConfirmationTime: null, // Timestamp of last confirmation
+      totalInvested: 0,         // Total amount of quote currency invested
+      totalQuantity: 0,         // Total quantity of base currency bought
+      averagePrice: 0,          // Weighted average price of all buys
+      buyCount: 0,              // Number of buy orders placed for this signal
+      lastBuyPrice: 0,          // Price of the last buy order
+      orderIds: []              // Array of order IDs for this signal
+    };
+    
+    // Track all trades for P&L calculation
+    this.tradeHistory = [];
+    
+    // Track the last buy time to prevent rapid consecutive buys
+    this.lastBuyTime = 0;
+    this.buyCooldown = 60 * 1000; // 1 minute cooldown between buys
+  }
+
+  async loadAccounts() {
+    try {
+      // Load actual balances from the exchange
+      const balances = await this.getAccountBalances();
+      
+      // Initialize accounts object with default values
+      this.accounts = {
+        [this.baseCurrency]: { available: '0', balance: '0', hold: '0' },
+        [this.quoteCurrency]: { available: '0', balance: '0', hold: '0' }
+      };
+      
+      // Update accounts with actual balances if available
+      for (const [currency, balance] of Object.entries(balances)) {
+        if (this.accounts[currency]) {
+          this.accounts[currency] = {
+            ...this.accounts[currency],
+            ...balance
+          };
+        }
+      }
+      
+      return this.accounts;
+      
+    } catch (error) {
+      console.error('Error loading accounts:', error.message);
+      this.isRunning = false;
+      throw error; // Re-throw to be handled by the caller
+    }
+  }
+
+  async initialize() {
+    // Prevent multiple initializations
+    if (this._isInitializing) {
+      logger.warn('Initialization already in progress, skipping duplicate initialize');
+      return false;
+    }
+    
+    // Initialize hourly candles
+    await this.updateHourlyCandles();
+
+    this._isInitializing = true;
+    
+    try {
+      console.log('\n=== Initializing SYRUP-USDC Trading Bot ===\n');
+      
+      // Load accounts and log balances immediately
+      console.log('Loading account balances...');
+      await this.loadAccounts();
+      
+      // Force immediate display of account balances with proper formatting
+      const baseBalance = parseFloat(this.accounts[this.baseCurrency]?.balance || 0);
+      const baseAvailable = parseFloat(this.accounts[this.baseCurrency]?.available || 0);
+      const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.balance || 0);
+      const quoteAvailable = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
+      
+      console.log('\n=== ACCOUNT BALANCES ===');
+      console.log(`${this.baseCurrency.padEnd(8)}: ${this.formatPrice(baseBalance, this.baseCurrency)} (Available: ${this.formatPrice(baseAvailable, this.baseCurrency)})`);
+      console.log(`${this.quoteCurrency.padEnd(8)}: ${this.formatPrice(quoteBalance, this.quoteCurrency)} (Available: ${this.formatPrice(quoteAvailable, this.quoteCurrency)})`);
+      console.log('========================\n');
+      
+      // Check if trading pair is valid
+      console.log('Verifying trading pair...');
+      await this.checkProductDetails();
+      
+      // Load candle data - wait for this to complete before proceeding
+      logger.info('Loading initial candle data...');
+      await this.fetchInitialCandles();
+      
+      // Ensure we have candles before proceeding
+      if (this.candles.length === 0) {
+        throw new Error('Failed to load initial candle data');
+      }
+      
+      // Load hourly candles before starting the trading cycle
+      logger.info('Fetching initial hourly candle data...');
+      try {
+        await this.updateHourlyCandles(true); // Force update during initialization
+        if (this.hourlyCandles.length === 0) {
+          logger.warn('No hourly candles available, 24h low calculation will be less accurate');
+        } else {
+          logger.info(`Successfully loaded ${this.hourlyCandles.length} hours of candle data for 24h low calculation`);
+        }
+      } catch (hourlyError) {
+        logger.error('Error loading hourly candles:', hourlyError);
+        logger.warn('Continuing with 1-minute candles for 24h low calculation');
+      }
+      
+      // Load position data if exists
+      await this.loadPosition();
+      
+      this.initialized = true;
+      logger.info('Initialization completed successfully');
+    } catch (error) {
+      logger.error('Error during initialization:', error);
+      throw new Error('Failed to initialize: ' + error.message);
+    } finally {
+      this.initializing = false;
+    }
+  }
+  
+  async loadCachedCandles() {
+    try {
+      const data = await fs.readFile(config.cacheFile, 'utf8');
+      const parsed = JSON.parse(data);
+      
+      // Validate and parse cached candles
+      if (parsed && Array.isArray(parsed.candles)) {
+        const candles = [];
+        let validCandles = 0;
+        let invalidCandles = 0;
+        
+        for (const candle of parsed.candles) {
+          const processed = processCandle(candle);
+          if (processed) {
+            candles.push(processed);
+            validCandles++;
+          } else {
+            invalidCandles++;
+          }
+        }
+        
+        // Sort by time (oldest first), remove duplicates, and limit to last 60 candles
+        const uniqueCandles = candles
+          .sort((a, b) => a.time - b.time)
+          .filter((candle, index, array) => 
+            index === 0 || candle.time !== array[index - 1].time
+          )
+          .slice(-60); // Only keep the last 60 candles (60 minutes)
+        
+        logger.info(`Loaded ${uniqueCandles.length} valid candles from cache (${invalidCandles} invalid, limited to last 60 candles)`);
+        return uniqueCandles;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        logger.warn('Error reading cache file:', error);
+      } else {
+        logger.info('No cache file found, will create a new one');
+      }
+    }
+    return [];
+  }
+
+  async saveCandlesToCache() {
+    if (!this.candles || this.candles.length === 0) {
+      logger.warn('No candles to save to cache');
+      return;
+    }
+    
+    try {
+      const cachePath = path.join(scriptDir, 'candle_cache.json');
+      
+      // Create a clean copy of candles with just the data we want to save
+      // Take only the most recent 60 candles
+      const recentCandles = this.candles.slice(-60);
+      const candlesToSave = recentCandles.map(candle => ({
+        time: candle.time,  // Already in Unix seconds
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume
+      }));
+      
+      const cacheData = {
+        candles: candlesToSave,
+        timestamp: Math.floor(Date.now() / 1000), // Save current time in Unix seconds
+        metadata: {
+          tradingPair: this.tradingPair,
+          count: candlesToSave.length,
+          firstCandle: candlesToSave.length > 0 ? formatTimestamp(candlesToSave[0].time) : null,
+          lastCandle: candlesToSave.length > 0 ? formatTimestamp(candlesToSave[candlesToSave.length - 1].time) : null
+        }
+      };
+      
+      // Write to a temporary file first, then rename to avoid corruption
+      const tempPath = `${cachePath}.tmp`;
+      await fs.writeFile(tempPath, JSON.stringify(cacheData, null, 2));
+      
+      // On Windows, we need to remove the destination file first if it exists
+      try {
+        await fs.unlink(cachePath);
+      } catch (e) {
+        // Ignore if file doesn't exist
+        if (e.code !== 'ENOENT') throw e;
+      }
+      
+      // Rename temp file to final name
+      await fs.rename(tempPath, cachePath);
+      
+      logger.info(`Saved ${candlesToSave.length} candles to cache (${cachePath})`);
+      
+    } catch (error) {
+      logger.error('Error saving candles to cache:', error);
+      // Don't throw, as this isn't a critical error
+      logger.warn('Continuing without saving to cache');
+    }
+  }
+
+  async fetchInitialCandles() {
+    try {
+      logger.info('Fetching initial candle data...');
+      const response = await this.client.getPublicProductCandles({
+        product_id: this.tradingPair,
+        granularity: config.candleInterval,
+        limit: 300
+      });
+      
+      if (!response?.candles?.length) {
+        throw new Error('No candles returned in API response');
+      }
+
+      const newCandles = [];
+      let validCandles = 0;
+      let invalidCandles = 0;
+      
+      for (const candle of response.candles) {
+        const processed = processCandle(candle);
+        if (processed) {
+          newCandles.push(processed);
+          validCandles++;
+        } else {
+          invalidCandles++;
+        }
+      }
+      
+      if (validCandles === 0) {
+        throw new Error('No valid candles could be processed from the API response');
+      }
+      
+      // Sort by time (oldest first) and remove duplicates
+      this.candles = newCandles
+        .sort((a, b) => a.time - b.time)
+        .filter((candle, index, array) => 
+          index === 0 || candle.time !== array[index - 1].time
+        );
+      
+      logger.info(`Processed ${validCandles} valid candles (${invalidCandles} invalid)`);
+      
+      if (this.candles.length > 0) {
+        await this.saveCandlesToCache();
+      } else {
+        logger.warn('No valid candles to save to cache');
+      }
+      
+      return this.candles;
+      
+    } catch (error) {
+      logger.error('Error in fetchInitialCandles:', error);
+      throw error;
+    }
+  }
+
+  async backfillMissingCandles() {
+    const requestId = `backfill-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const MAX_CANDLES = 60; // Enforce 60-candle limit (1 hour of 1-minute candles)
+    
+    // Prevent multiple concurrent backfills
+    if (this._isBackfilling) {
+      logger.debug(`[${requestId}] Backfill already in progress, skipping`);
+      return;
+    }
+    
+    try {
+      this._isBackfilling = true;
+      logger.info(`[${requestId}] Starting backfill process (max ${MAX_CANDLES} candles)...`);
+      
+      // If we have no candles at all, fetch initial data
+      if (!this.candles || this.candles.length === 0) {
+        logger.info(`[${requestId}] No candles available, fetching initial data...`);
+        await this.fetchInitialCandles();
+        return;
+      }
+      
+      // Process and validate all candles
+      const candleMap = new Map(); // Use a map to deduplicate by timestamp
+      let invalidCandles = 0;
+      
+      logger.debug(`[${requestId}] Validating ${this.candles.length} existing candles`);
+      
+      // Process existing candles, keeping only the most recent ones
+      for (const candle of this.candles) {
+        try {
+          const processed = processCandle(candle);
+          if (processed) {
+            // Only keep the most recent candle for each timestamp
+            if (!candleMap.has(processed.time) || 
+                (candleMap.get(processed.time).time < processed.time)) {
+              candleMap.set(processed.time, processed);
+            }
+          } else {
+            invalidCandles++;
+            logger.debug(`[${requestId}] Invalid candle filtered out:`, candle);
+          }
+        } catch (error) {
+          invalidCandles++;
+          logger.debug(`[${requestId}] Error processing candle:`, error);
+        }
+      }
+      
+      // Convert map values to array, sort by time, and enforce 60-candle limit
+      this.candles = Array.from(candleMap.values())
+        .sort((a, b) => a.time - b.time)
+        .slice(-MAX_CANDLES); // Enforce 60-candle limit
+      
+      if (invalidCandles > 0) {
+        logger.info(`[${requestId}] Filtered out ${invalidCandles} invalid candles during backfill`);
+      }
+      
+      logger.info(`[${requestId}] Validated ${this.candles.length} candles after backfill`);
+      
+      // If we don't have enough valid candles, fetch initial data
+      if (this.candles.length < 5) {
+        logger.info(`[${requestId}] Not enough valid candles (${this.candles.length}), fetching initial data...`);
+        await this.fetchInitialCandles();
+        return;
+      }
+      
+      // Get the newest candle timestamp in seconds
+      const newestCandle = this.candles[this.candles.length - 1];
+      const newestTime = Math.floor(newestCandle.time / 1000);
+      
+      // Validate timestamp
+      if (isNaN(newestTime) || newestTime <= 0) {
+        throw new Error(`[${requestId}] Invalid newest candle time: ${newestCandle.time}`);
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      const oneHourAgo = now - 3600; // Only need to maintain 1 hour of data (60 candles)
+      
+      // Only backfill if we're missing data within the last hour
+      if (newestTime < oneHourAgo - 60) { // Allow 1 minute buffer
+        const missingMinutes = Math.min(
+          Math.floor((now - newestTime) / 60), // Max missing minutes
+          MAX_CANDLES - this.candles.length // Don't exceed our 60-candle limit
+        );
+        
+        if (missingMinutes > 0) {
+          logger.info(`[${requestId}] Missing ${missingMinutes} minutes of data, backfilling...`);
+          // Fetch missing data using fetchCandleData which will respect our 60-candle limit
+          await this.fetchCandleData(true);
+        }
+      }
+      
+      // Enforce 60-candle limit after backfill
+      if (this.candles.length > MAX_CANDLES) {
+        const removeCount = this.candles.length - MAX_CANDLES;
+        this.candles = this.candles.slice(-MAX_CANDLES);
+        logger.debug(`[${requestId}] Trimmed ${removeCount} oldest candles to maintain 60-candle limit`);
+      }
+      
+      // Save the updated candles to cache
+      if (this.candles.length > 0) {
+        await this.saveCandlesToCache();
+        logger.debug(`[${requestId}] Backfill complete, maintaining ${this.candles.length} most recent candles`);
+      } else {
+        logger.warn(`[${requestId}] No valid candles to save after backfill`);
+      }
+      
+    } catch (error) {
+      logger.error(`[${requestId}] Error in backfillMissingCandles:`, error);
+      throw error; // Re-throw to be handled by the caller
+    } finally {
+      this._isBackfilling = false;
+      logger.debug(`[${requestId}] Backfill process completed`);
+    }
+  }
+
+  async fetchInitialCandles() {
+    try {
+      logger.info('Fetching initial candle data...');
+      const response = await this.client.getPublicProductCandles({
+        product_id: this.tradingPair,
+        granularity: config.candleInterval,
+        limit: 300
+      });
+      
+      if (!response?.candles?.length) {
+        throw new Error('No candles returned in API response');
+      }
+
+      const newCandles = [];
+      let validCandles = 0;
+      let invalidCandles = 0;
+      
+      for (const candle of response.candles) {
+        const processed = processCandle(candle);
+        if (processed) {
+          newCandles.push(processed);
+          validCandles++;
+        } else {
+          invalidCandles++;
+        }
+      }
+      
+      if (validCandles === 0) {
+        throw new Error('No valid candles could be processed from the API response');
+      }
+      
+      // Sort by time (oldest first) and remove duplicates
+      this.candles = newCandles
+        .sort((a, b) => a.time - b.time)
+        .filter((candle, index, array) => 
+          index === 0 || candle.time !== array[index - 1].time
+        );
+      
+      logger.info(`Processed ${validCandles} valid candles (${invalidCandles} invalid)`);
+      
+      if (this.candles.length > 0) {
+        await this.saveCandlesToCache();
+      } else {
+        logger.warn('No valid candles to save to cache');
+      }
+      
+      return this.candles;
+      
+    } catch (error) {
+      logger.error('Error in fetchInitialCandles:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Backfills candle data by breaking down large time ranges into smaller windows
+   * to avoid API time range limits.
+   * @param {number} startTime - Start time in seconds
+   * @param {number} endTime - End time in seconds
+   * @param {number} [maxWindowHours=4] - Maximum window size in hours
+   * @returns {Promise<Array>} - Array of processed candles
+   */
+  async backfillWithSmallerWindows(startTime, endTime, maxWindowHours = 4) {
+    const windowMs = maxWindowHours * 60 * 60 * 1000; // Convert to milliseconds
+    const startDate = new Date(startTime * 1000);
+    const endDate = new Date(endTime * 1000);
+    let currentStart = startDate;
+    
+    const allCandles = [];
+    
+    logger.info(`Backfilling with smaller windows from ${startDate.toISOString()} to ${endDate.toISOString()}`);
+    
+    while (currentStart < endDate) {
+      const currentEnd = new Date(Math.min(currentStart.getTime() + windowMs, endDate.getTime()));
+      
+      logger.info(`Fetching window: ${currentStart.toISOString()} to ${currentEnd.toISOString()}`);
+      
+      try {
+        const response = await this.client.getPublicProductCandles({
+          product_id: this.tradingPair,
+          start: Math.floor(currentStart.getTime() / 1000).toString(),
+          end: Math.floor(currentEnd.getTime() / 1000).toString(),
+          granularity: 'ONE_MINUTE'
+        });
+        
+        if (response?.candles?.length > 0) {
+          const processed = this.processCandlesFromResponse(response);
+          allCandles.push(...processed);
+          logger.info(`Added ${processed.length} candles from window, total: ${allCandles.length}`);
+        }
+      } catch (error) {
+        logger.error(`Error fetching window ${currentStart.toISOString()} to ${currentEnd.toISOString()}:`, error.message);
+        
+        // If we hit a rate limit, wait and retry with a smaller window
+        if (error.message?.includes('rate limit') || error.status === 429) {
+          const retryAfter = parseInt(error.headers?.['retry-after'] || '5', 10) * 1000;
+          logger.warn(`Rate limited, waiting ${retryAfter}ms before retrying with smaller window...`);
+          await new Promise(resolve => setTimeout(resolve, retryAfter));
+          
+          // Try again with half the window size
+          return this.backfillWithSmallerWindows(
+            Math.floor(currentStart.getTime() / 1000),
+            Math.floor(currentEnd.getTime() / 1000),
+            maxWindowHours / 2
+          );
+        }
+      }
+      
+      // Move to next window
+      currentStart = new Date(currentEnd.getTime() + 1000); // Add 1s to avoid overlap
+      
+      // Add a small delay between requests to avoid rate limiting
+      if (currentStart < endDate) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+    
+    // Sort and deduplicate all candles
+    const uniqueCandles = [];
+    const seen = new Set();
+    
+    allCandles
+      .sort((a, b) => a.time - b.time)
+      .forEach(candle => {
+        if (!seen.has(candle.time)) {
+          seen.add(candle.time);
+          uniqueCandles.push(candle);
+        }
+      });
+    
+    logger.info(`Backfill complete. Processed ${uniqueCandles.length} unique candles`);
+    return uniqueCandles;
+  }
+  
+
+
+  async checkProductDetails() {
+    try {
+      logger.info(`Checking product details for ${this.tradingPair}`);
+      const product = await this.client.getProduct({ id: this.tradingPair });
+      
+      if (product?.status === 'not_found') {
+        logger.error(`Trading pair ${this.tradingPair} not found on Coinbase`);
+        
+        // List available USDC and SYRUP pairs for debugging
+        const products = await this.client.getPublicProducts();
+        if (products?.products) {
+          const usdcPairs = products.products
+            .filter(p => p.quote_currency_id === 'USDC' || p.base_currency_id === 'USDC')
+            .map(p => p.product_id);
+            
+          const syrupPairs = products.products
+            .filter(p => p.quote_currency_id === 'SYRUP' || p.base_currency_id === 'SYRUP')
+            .map(p => p.product_id);
+            
+          logger.info(`Available USDC pairs (${usdcPairs.length}):`, usdcPairs);
+          logger.info(`Available SYRUP pairs (${syrupPairs.length}):`, syrupPairs);
+        }
+      } else if (product?.trading_disabled) {
+        logger.error(`Trading is disabled for ${this.tradingPair}`);
+      } else {
+        logger.warn(`Product ${this.tradingPair} exists but no candle data returned`);
+      }
+    } catch (error) {
+      logger.error('Error fetching product details:', error.message);
+    }
+  }
+  
+  processCandlesFromResponse(response) {
+    if (!response?.candles?.length) return [];
+    
+    const processedCandles = [];
+    
+    for (const candle of response.candles) {
+      try {
+        // Handle different response formats
+        const c = candle.candle || candle;
+        
+        // Extract candle data with fallbacks
+        const time = c.start || c.time;
+        const open = parseFloat(c.open);
+        const high = parseFloat(c.high);
+        const low = parseFloat(c.low);
+        const close = parseFloat(c.close);
+        const volume = parseFloat(c.volume || 0);
+        
+        // Skip if we don't have required fields
+        if (!time || isNaN(open) || isNaN(high) || isNaN(low) || isNaN(close)) {
+          logger.warn('Skipping invalid candle data', { candle });
+          continue;
+        }
+        
+        // Convert time to seconds if it's in milliseconds
+        const timestamp = time > 1e12 ? Math.floor(time / 1000) : time;
+        
+        processedCandles.push({
+          time: timestamp,
+          open,
+          high,
+          low,
+          close,
+          volume: isNaN(volume) ? 0 : volume
+        });
+        
+      } catch (error) {
+        logger.warn('Error processing candle:', { error, candle });
+      }
+    }
+    
+    return processedCandles;
+  }
+
+  async fetchCandleData(backfill = false) {
+    const requestId = `fetch-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const now = new Date();
+    const nowMs = now.getTime();
+    
+    // Prevent multiple concurrent fetches
+    if (this._isFetching) {
+      logger.debug(`[${requestId}] Fetch already in progress, skipping`);
+      return this.candles;
+    }
+    
+    // Rate limiting - don't allow fetches more than once every 30 seconds
+    if (this._lastFetchTime && (nowMs - this._lastFetchTime < 30000)) {
+      logger.debug(`[${requestId}] Rate limited, last fetch was ${(nowMs - this._lastFetchTime) / 1000} seconds ago`);
+      return this.candles;
+    }
+    
+    this._isFetching = true;
+    this._lastFetchTime = nowMs;
+    
+    // Set a timeout to prevent hanging
+    this._fetchTimeout = setTimeout(() => {
+      if (this._isFetching) {
+        logger.warn(`[${requestId}] Fetch timed out after 30 seconds`);
+        this._isFetching = false;
+        if (this._fetchTimeout) {
+          clearTimeout(this._fetchTimeout);
+          this._fetchTimeout = null;
+        }
+      }
+    }, 30000);
+    
+    const cleanup = () => {
+      if (this._fetchTimeout) {
+        clearTimeout(this._fetchTimeout);
+        this._fetchTimeout = null;
+      }
+      this._isFetching = false;
+    };
+    
+    try {
+      logger.debug(`[${requestId}] Starting candle data fetch`, { backfill });
+      
+        // If we're not backfilling, check if we already have recent data
+        if (!backfill && this.candles.length > 0) {
+          const lastCandleTime = this.candles[this.candles.length - 1]?.time || 0;
+          const nowSec = Math.floor(now.getTime() / 1000);
+          const secondsSinceLastCandle = nowSec - lastCandleTime;
+          
+          // If we have data from the last 45 seconds, use the cached data
+          if (secondsSinceLastCandle < 45) {
+            logger.debug(`[${requestId}] Using cached candle data`, { 
+              lastCandleTime: new Date(lastCandleTime * 1000).toISOString(),
+              now: now.toISOString(),
+              ageSeconds: secondsSinceLastCandle
+            });
+            return this.candles;
+          }
+        }
+        
+        // Calculate time range for the request - only fetch what we need
+        const endTime = new Date(now);
+        let startTime;
+        
+        if (backfill && this.candles.length === 0) {
+          // For initial backfill with no existing candles, just get the last 60 minutes
+          startTime = new Date(now.getTime() - 3600000);
+          logger.debug('Initial backfill: fetching last 60 minutes of data');
+        } else if (this.candles.length > 0) {
+          // For regular updates, only fetch new data since our last candle
+          const lastCandleTime = new Date(this.candles[this.candles.length - 1].time * 1000);
+          startTime = new Date(lastCandleTime.getTime() - 60000); // Start 1 minute before last candle to ensure no gaps
+          logger.debug(`Fetching new candles since last candle at ${lastCandleTime.toISOString()}`);
+        } else {
+          // Default case: just get the last 60 minutes
+          startTime = new Date(now.getTime() - 3600000);
+          logger.debug('No existing candles, fetching last 60 minutes of data');
+        }
+      
+        // Ensure we don't request data from the future
+        if (startTime > now) {
+          startTime = new Date(now.getTime() - 3600000);
+        }
+        
+        // Ensure start time is not in the future
+        if (startTime > now) {
+          startTime = new Date(now.getTime() - 3600000); // Default to 1 hour ago
+        }
+        
+        // Ensure end time is not before start time
+        if (endTime <= startTime) {
+          logger.warn('End time is not after start time, adjusting...');
+          startTime = new Date(endTime.getTime() - 3600000); // Set start to 1 hour before end
+        }
+        
+        logger.info(`Fetching candle data`, { 
+          startTime: startTime.toISOString(),
+          endTime: endTime.toISOString(),
+          backfill,
+          tradingPair: this.tradingPair
+        });
+        
+        // Convert to ISO strings for the API and ensure they're in the correct format
+        const startIso = startTime.toISOString();
+        const endIso = endTime.toISOString();
+        
+        // Log the exact request parameters for debugging
+        logger.debug('Fetching candles with params:', {
+          product_id: this.tradingPair,
+          start: startIso,
+          end: endIso,
+          granularity: 'ONE_MINUTE'
+        });
+        
+        let apiResponse;
+        
+        try {
+          // First try with Unix timestamps in seconds
+          const startUnix = Math.floor(startTime.getTime() / 1000);
+          const endUnix = Math.floor(endTime.getTime() / 1000);
+          logger.debug(`Trying with Unix timestamps: start=${startUnix}, end=${endUnix}`);
+          
+          apiResponse = await this.client.getPublicProductCandles({
+            product_id: this.tradingPair,
+            start: startUnix.toString(),
+            end: endUnix.toString(),
+            granularity: 'ONE_MINUTE'
+          });
+          
+          logger.debug('Successfully fetched candles with Unix timestamps');
+        } catch (unixError) {
+          // If that fails, try with ISO strings
+          logger.warn('Failed to fetch with Unix timestamps, trying with ISO strings', { error: unixError.message });
+          
+          try {
+            apiResponse = await this.client.getPublicProductCandles({
+              product_id: this.tradingPair,
+              start: startIso,
+              end: endIso,
+              granularity: 'ONE_MINUTE'
+            });
+            logger.debug('Successfully fetched candles with ISO strings');
+          } catch (isoError) {
+            logger.error('Failed to fetch candles with both Unix and ISO timestamps', { 
+              unixError: unixError.message, 
+              isoError: isoError.message 
+            });
+            throw new Error(`Failed to fetch candles: ${isoError.message}`);
+          }
+        }
+        
+        // Validate the API response
+        if (!apiResponse?.candles) {
+          throw new Error('Invalid response format from getPublicProductCandles');
+        }
+        
+        // Process the candles
+        const processedCandles = this.processCandlesFromResponse(apiResponse);
+        
+        if (backfill) {
+          // For backfill, replace all candles
+          this.candles = processedCandles;
+          logger.info(`Backfilled ${processedCandles.length} candles`);
+        } else {
+          // For regular updates, merge and deduplicate candles
+          let addedCount = 0;
+          const candleMap = new Map();
+          
+          // Add existing candles to map (except possibly stale ones)
+          this.candles.forEach(candle => {
+            // Only keep candles from the last 65 minutes (slight buffer over 60)
+            if (candle.time * 1000 > now.getTime() - 3900000) { // 65 minutes in ms
+              candleMap.set(candle.time, candle);
+            }
+          });
+          
+          // Add new candles, overwriting any with the same timestamp
+          processedCandles.forEach(candle => {
+            if (!candleMap.has(candle.time)) {
+              addedCount++;
+            }
+            candleMap.set(candle.time, candle);
+          });
+          
+          // Convert map values to array, sort by time, and take most recent 60 candles
+          const MAX_CANDLES = 60;
+          const allCandles = Array.from(candleMap.values())
+            .sort((a, b) => a.time - b.time);
+            
+          // Always take the most recent 60 candles
+          this.candles = allCandles.slice(-MAX_CANDLES);
+          
+          // Log if we had to trim any candles
+          if (allCandles.length > MAX_CANDLES) {
+            const removed = allCandles.length - MAX_CANDLES;
+            logger.debug(`Trimmed ${removed} old candles, maintaining ${this.candles.length} most recent candles`);
+          }
+          
+          if (addedCount > 0) {
+            logger.info(`Merged ${addedCount} new candles, maintaining ${this.candles.length} most recent candles`);
+          }
+        }
+        
+        // Save to cache if we have candles
+        if (this.candles.length > 0) {
+          try {
+            await this.saveCandlesToCache();
+            logger.debug('Successfully saved candles to cache');
+          } catch (cacheError) {
+            logger.error('Error saving candles to cache:', cacheError);
+          }
+        }
+        
+        return this.candles;
+        
+      } catch (error) {
+        logger.error(`[${requestId}] Error fetching candle data:`, {
+          error: error.message,
+          stack: error.stack,
+          code: error.code,
+          requestId,
+          backfill
+        });
+        
+        // If we have cached data, return that instead of failing
+        if (this.candles.length > 0) {
+          logger.warn('Returning cached candle data due to error');
+          return this.candles;
+        }
+        
+        // For rate limiting, add additional backoff
+        if (error.response?.status === 429) {
+          const retryAfter = error.response.headers['retry-after'] || 60;
+          logger.warn(`Rate limited. Will retry after ${retryAfter} seconds`);
+          this._lastFetchTime = nowMs + (retryAfter * 1000);
+        }
+        
+        throw error;
+      } finally {
+        cleanup();
+        
+        // Ensure we don't get stuck in a failed state
+        if (this._isFetching) {
+          logger.warn('Force resetting _isFetching flag in finally block');
+          this._isFetching = false;
+        }
+      }
+    }
+  
+  calculateIndicators() {
+    try {
+      if (this.candles.length === 0) {
+        return;
+      }
+      
+      // Get the most recent candles (up to the maximum period needed by any indicator)
+      const maxPeriod = Math.max(
+        this.buyConfig.emaSlowPeriod || 0,
+        this.buyConfig.stochPeriod || 0,
+        this.buyConfig.bbPeriod || 0,
+        this.buyConfig.macdSlowPeriod || 0
+      );
+      
+      // Get the most recent candles needed for calculations
+      const recentCandles = this.candles.slice(-(maxPeriod * 2) - 1);
+      
+      const closes = recentCandles.map(c => parseFloat(c.close));
+      const highs = recentCandles.map(c => parseFloat(c.high));
+      const lows = recentCandles.map(c => parseFloat(c.low));
+      
+      // Calculate indicators
+      const ema = EMA.calculate({
+        values: closes,
+        period: this.buyConfig.emaSlowPeriod
+      });
+      
+      const rsi = RSI.calculate({
+        values: closes,
+        period: this.buyConfig.rsiPeriod || 14
+      });
+      
+      const stoch = Stochastic.calculate({
+        high: highs,
+        low: lows,
+        close: closes,
+        period: this.buyConfig.stochPeriod || 14,
+        signalPeriod: this.buyConfig.stochDPeriod || 3,
+        kPeriod: this.buyConfig.stochKPeriod || 3
+      });
+      
+      const bb = BollingerBands.calculate({
+        values: closes,
+        period: this.buyConfig.bbPeriod || 20,
+        stdDev: this.buyConfig.bbStdDev || 2
+      });
+      
+      const macd = MACD.calculate({
+        values: closes,
+        fastPeriod: this.buyConfig.macdFastPeriod || 12,
+        slowPeriod: this.buyConfig.macdSlowPeriod || 26,
+        signalPeriod: this.buyConfig.macdSignalPeriod || 9,
+        SimpleMAOscillator: false,
+        SimpleMASignal: false
+      });
+      
+      // Get the most recent close price as the current price
+      const currentPrice = recentCandles.length > 0 ? 
+        parseFloat(recentCandles[recentCandles.length - 1].close) : 0;
+      
+      // Store the latest values
+      this.indicators = {
+        price: currentPrice,  // Add current price to indicators
+        ema: ema[ema.length - 1] || 0,
+        rsi: rsi[rsi.length - 1] || 0,
+        stochK: stoch[stoch.length - 1] ? stoch[stoch.length - 1].k : 0,
+        stochD: stoch[stoch.length - 1] ? stoch[stoch.length - 1].d : 0,
+        bbUpper: bb[bb.length - 1] ? bb[bb.length - 1].upper : 0,
+        bbMiddle: bb[bb.length - 1] ? bb[bb.length - 1].middle : 0,
+        bbLower: bb[bb.length - 1] ? bb[bb.length - 1].lower : 0,
+        macd: macd[macd.length - 1] ? macd[macd.length - 1].histogram : 0,
+        macdSignal: macd[macd.length - 1] ? macd[macd.length - 1].signal : 0,
+        macdLine: macd[macd.length - 1] ? macd[macd.length - 1].MACD : 0
+      };
+      
+      logger.debug('Updated indicators with price:', { 
+        price: this.indicators.price,
+        ema: this.indicators.ema,
+        rsi: this.indicators.rsi
+      });
+    } catch (error) {
+      logger.error('Error in calculateIndicators:', error);
+      throw error;
+    }
+  }
+
+  // Calculate buy score based on technical indicators (0-8)
+  calculateBuyScore(indicators) {
+    let score = 0;
+    const reasons = [];
+    const config = this.buyConfig;
+    const ema = indicators.ema || 0;
+    const rsi = indicators.rsi || 0;
+    const macd = indicators.macd || { histogram: 0, signal: 0, MACD: 0 };
+    const stochK = indicators.stochK || 0;
+    const stochD = indicators.stochD || 0;
+    const bb = indicators.bb || { upper: 0, middle: 0, lower: 0 };
+    const price = this.candles[this.candles.length - 1]?.close || 0;
+    
+    // 1. RSI - Oversold condition (Max 1.5 pts)
+    if (rsi < config.rsiOversold) {
+      score += 1.5;
+      reasons.push(`RSI ${rsi.toFixed(1)} < ${config.rsiOversold}`);
+    } else if (rsi < 45) {
+      score += 0.5;
+      reasons.push(`RSI ${rsi.toFixed(1)} < 45`);
+    }
+    
+    // 2. Stochastic - Oversold and crossovers (Max 2 pts)
+    if (stochK < config.stochOversold) {
+      score += 0.5;
+      reasons.push(`Stoch K ${stochK.toFixed(1)} < ${config.stochOversold}`);
+    }
+    
+    // Bullish crossover (K crosses above D)
+    if (stochK > stochD && stochK < 30) {
+      score += 1.5;
+      reasons.push('Stoch bullish crossover (K > D) in oversold zone');
+    }
+    
+    // 3. MACD - Bullish signals (Max 1.5 pts)
+    if (macd.histogram > 0) {
+      score += 0.5;
+      reasons.push('MACD histogram positive');
+    }
+    
+    if (macd.histogram > 0 && macd.histogram > macd.signal) {
+      score += 1;
+      reasons.push('MACD histogram rising');
+    }
+    
+    // 4. Price vs EMA (Max 1.5 pts)
+    if (price > ema) {
+      score += 0.5;
+      reasons.push('Price > EMA(20)');
+    }
+    
+    // 5. Bollinger Bands (Max 1.5 pts)
+    if (bb && typeof bb === 'object' && bb.lower !== undefined) {
+      if (price <= bb.lower) {
+        score += 1.5;
+        reasons.push('Price at or below lower BB');
+      } else if (bb.upper !== undefined && price < ((bb.upper - bb.lower) * 0.25) + bb.lower) {
+        score += 1;
+        reasons.push('Price in lower BB quartile');
+      }
+    } else {
+      // If BB data is invalid, skip this scoring component
+      logger.warn('Invalid or missing Bollinger Bands data');
+    }
+    
+    // Cap score at 8
+    const finalScore = Math.min(8, score);
+    
+    return {
+      score: parseFloat(finalScore.toFixed(1)),
+      reasons,
+      timestamp: new Date().toISOString()
+    };
+  }
+  
+  // Calculate dip score based on % below 60-min high (0-3 pts)
+  // Each point is now 0.5% lower than before (e.g., 0.5 points at 1.0% drop, 1 point at 1.5% drop, etc.)
+  calculateDipScore(currentPrice) {
+    // Get last 60 candles (1 hour)
+    const hourCandles = this.candles.slice(-60);
+    if (hourCandles.length < 5) {
+      return { 
+        score: 0, 
+        reasons: ['Insufficient data for dip calculation'],
+        high60m: 0,
+        currentPrice,
+        priceDrop: 0,
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    // Find highest high in the last hour
+    const high60m = Math.max(...hourCandles.map(c => c.high));
+    const priceDrop = ((high60m - currentPrice) / high60m) * 100;
+    
+    let score = 0;
+    const reasons = [];
+    
+    // Adjusted thresholds (0.5% lower than before)
+    if (priceDrop >= 3.5) {
+      score = 3;
+      reasons.push(`Price ${priceDrop.toFixed(2)}% below 60-min high`);
+    } else if (priceDrop >= 3.0) {
+      score = 2.5;
+      reasons.push(`Price ${priceDrop.toFixed(2)}% below 60-min high`);
+    } else if (priceDrop >= 2.5) {
+      score = 2;
+      reasons.push(`Price ${priceDrop.toFixed(2)}% below 60-min high`);
+    } else if (priceDrop >= 2.0) {
+      score = 1.5;
+      reasons.push(`Price ${priceDrop.toFixed(2)}% below 60-min high`);
+    } else if (priceDrop >= 1.5) {
+      score = 1;
+      reasons.push(`Price ${priceDrop.toFixed(2)}% below 60-min high`);
+    } else if (priceDrop >= 1.0) {
+      score = 0.5;
+      reasons.push(`Price ${priceDrop.toFixed(2)}% below 60-min high`);
+    }
+    
+    return {
+      score: parseFloat(score.toFixed(1)),
+      reasons,
+      high60m,
+      currentPrice,
+      priceDrop: parseFloat(priceDrop.toFixed(2)),
+      timestamp: new Date().toISOString()
+    };
+  }
+  
+  // Update hourly candles by fetching the latest hourly data
+  async updateHourlyCandles(force = false) {
+    const now = Date.now();
+    
+    // If we have recent data and not forced, skip update
+    const hasRecentData = this.hourlyCandles.length > 0 && 
+                         now - this.lastHourlyCandleUpdate < 3600000; // 1 hour in ms
+    
+    if (!force && hasRecentData) {
+      logger.debug('Skipping hourly candle update - data is recent');
+      return;
+    }
+    
+    // Prevent multiple concurrent updates
+    if (this._isUpdatingHourlyCandles) {
+      logger.debug('Hourly candle update already in progress');
+      return;
+    }
+    
+    this._isUpdatingHourlyCandles = true;
+    
+    // Clear existing candles when forcing an update
+    if (force) {
+      this.hourlyCandles = [];
+    }
+
+    try {
+      logger.info('Updating hourly candle data for 24h low calculation...');
+      
+      // Fetch hourly candles (24 hours worth)
+      const response = await this.client.getPublicProductCandles({
+        product_id: this.tradingPair,
+        granularity: 'ONE_HOUR', // Use string enum value for hourly candles
+        limit: 24 // We only need the last 24 hours
+      });
+
+      if (response?.candles?.length > 0) {
+        // Process and store the hourly candles
+        this.hourlyCandles = response.candles
+          .map(candle => ({
+            time: Math.floor(new Date(candle.start).getTime() / 1000),
+            open: parseFloat(candle.open),
+            high: parseFloat(candle.high),
+            low: parseFloat(candle.low),
+            close: parseFloat(candle.close),
+            volume: parseFloat(candle.volume || 0)
+          }))
+          .sort((a, b) => a.time - b.time);
+        
+        this.lastHourlyCandleUpdate = now;
+        logger.info(`Updated hourly candles, now have ${this.hourlyCandles.length} hours of data`);
+      }
+    } catch (error) {
+      logger.error('Error updating hourly candles:', error);
+      // Don't throw, we'll try again next time
+    } finally {
+      this._isUpdatingHourlyCandles = false;
+    }
+  }
+
+  // Calculate 24h low proximity score (0-10 points)
+  // Higher scores are given when price is closer to the 24h low
+  async calculate24hLowScore(currentPrice) {
+    try {
+      // Ensure we have a valid current price
+      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+        throw new Error(`Invalid current price: ${currentPrice}`);
+      }
+      
+      let low24h = 0;
+      let percentAbove24hLow = 0;
+      
+      // Ensure we have enough data
+      if (!this.hourlyCandles || this.hourlyCandles.length < 24) {
+        // Fallback to 1-minute candles if we don't have hourly data yet
+        logger.warn('No hourly candles available, falling back to 1-minute candles');
+        const dailyCandles = (this.candles || []).slice(-1440);
+        
+        if (dailyCandles.length < 60) {
+          throw new Error('Insufficient data for 24h low calculation');
+        }
+        
+        const validDailyCandles = dailyCandles.filter(candle => 
+          candle && typeof candle.low === 'number' && !isNaN(candle.low) && candle.low > 0
+        );
+        
+        if (validDailyCandles.length === 0) {
+          throw new Error('No valid daily candles found for 24h low calculation');
+        }
+        
+        low24h = Math.min(...validDailyCandles.map(candle => candle.low));
+      } else {
+        // Use hourly candles for more accurate 24h low calculation
+        const validHourlyCandles = this.hourlyCandles.filter(candle => 
+          candle && typeof candle.low === 'number' && !isNaN(candle.low) && candle.low > 0
+        );
+        
+        if (validHourlyCandles.length === 0) {
+          throw new Error('No valid hourly candles found for 24h low calculation');
+        }
+        
+        low24h = Math.min(...validHourlyCandles.map(candle => candle.low));
+      }
+      
+      // Ensure we have a valid low24h before proceeding
+      if (typeof low24h !== 'number' || isNaN(low24h) || low24h <= 0) {
+        throw new Error(`Invalid 24h low value: ${low24h}`);
+      }
+      
+      percentAbove24hLow = ((currentPrice - low24h) / low24h) * 100;
+      
+      // Ensure we have a valid percentage
+      if (isNaN(percentAbove24hLow) || !isFinite(percentAbove24hLow)) {
+        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, low24h=${low24h}`);
+      }
+      
+      return this.calculate24hLowScoreFromValues(low24h, currentPrice, percentAbove24hLow);
+      
+    } catch (error) {
+      logger.error(`Error in calculate24hLowScore: ${error.message}`, { currentPrice });
+      return {
+        score: 0,
+        reasons: [`Error calculating 24h low score: ${error.message}`],
+        low24h: 0,
+        currentPrice: currentPrice || 0,
+        percentAbove24hLow: 0,
+        timestamp: new Date().toISOString()
+      };
+    }
+  }
+  
+  // Helper method to calculate the score from pre-computed values
+  calculate24hLowScoreFromValues(low24h, currentPrice, percentAbove24hLow) {
+    try {
+      // Input validation
+      if (typeof low24h !== 'number' || isNaN(low24h) || low24h <= 0) {
+        throw new Error(`Invalid low24h: ${low24h}`);
+      }
+      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+        throw new Error(`Invalid currentPrice: ${currentPrice}`);
+      }
+      if (typeof percentAbove24hLow !== 'number' || isNaN(percentAbove24hLow)) {
+        throw new Error(`Invalid percentAbove24hLow: ${percentAbove24hLow}`);
+      }
+      
+      // Ensure we have valid score ranges
+      if (!Array.isArray(this.buyConfig?.low24hScoreRanges) || this.buyConfig.low24hScoreRanges.length === 0) {
+        throw new Error('Invalid or missing low24hScoreRanges configuration');
+      }
+      
+      // Find the appropriate score based on the configured ranges
+      let score = 0;
+      let scoreRange = '>5%';
+      
+      for (const range of this.buyConfig.low24hScoreRanges) {
+        if (range && typeof range.maxPercent === 'number' && 
+            typeof range.score === 'number' && 
+            percentAbove24hLow <= range.maxPercent) {
+          score = range.score;
+          scoreRange = range.maxPercent === Infinity ? '>5%' : `≤${range.maxPercent}%`;
+          break;
+        }
+      }
+      
+      // Format values safely for display
+      const formatValue = (value, decimals = 6) => {
+        try {
+          if (typeof value !== 'number' || isNaN(value)) return 'N/A';
+          return value.toFixed(decimals);
+        } catch (e) {
+          return 'N/A';
+        }
+      };
+      
+      return {
+        score,
+        reasons: [
+          `24h Low Score: ${score}/10 (${formatValue(percentAbove24hLow, 2)}% above 24h low, range: ${scoreRange})`,
+          `Low 24h: ${formatValue(low24h)}`,
+          `Current: ${formatValue(currentPrice)}`,
+          `Percent above: ${formatValue(percentAbove24hLow, 2)}%`
+        ],
+        low24h,
+        currentPrice,
+        percentAbove24hLow,
+        timestamp: new Date().toISOString()
+      };
+      
+    } catch (error) {
+      logger.error(`Error in calculate24hLowScoreFromValues: ${error.message}`, { 
+        low24h, 
+        currentPrice, 
+        percentAbove24hLow 
+      });
+      
+      return {
+        score: 0,
+        reasons: [`Error in 24h low score calculation: ${error.message}`],
+        low24h: low24h || 0,
+        currentPrice: currentPrice || 0,
+        percentAbove24hLow: percentAbove24hLow || 0,
+        timestamp: new Date().toISOString()
+      };
+    }
+  }
+  
+  // Get 2-candle confirmation for buy signals
+  getTwoCandleConfirmation() {
+    // Keep only signals from the last 5 minutes to ensure we don't lose signals too quickly
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    this.pendingBuySignals = this.pendingBuySignals
+      .filter(signal => new Date(signal.timestamp) >= fiveMinutesAgo);
+    
+    // Sort signals by timestamp to ensure correct order (oldest first)
+    const sortedSignals = [...this.pendingBuySignals].sort((a, b) => 
+      new Date(a.timestamp) - new Date(b.timestamp)
+    );
+    
+    // Debug log the current state of pending signals
+    if (sortedSignals.length > 0) {
+      logger.debug(`Pending signals (${sortedSignals.length}):`, {
+        signals: sortedSignals.map(s => ({
+          time: s.timestamp,
+          score: s.score,
+          price: s.price
+        }))
+      });
+    }
+    
+    // Need at least 2 signals within the time window
+    if (sortedSignals.length >= 2) {
+      // Try to find two valid signals that are at least 1 minute apart
+      for (let i = sortedSignals.length - 1; i > 0; i--) {
+        const latestSignal = sortedSignals[i];
+        
+        // Find the most recent previous signal that's at least 1 minute older
+        for (let j = i - 1; j >= 0; j--) {
+          const prevSignal = sortedSignals[j];
+          const timeDiff = (new Date(latestSignal.timestamp) - new Date(prevSignal.timestamp)) / 1000 / 60; // in minutes
+          
+          // If signals are from different candles (at least 1 minute apart) and both meet minimum score
+          if (timeDiff >= 1) {
+            if (latestSignal.score >= this.buyConfig.minScore && 
+                prevSignal.score >= this.buyConfig.minScore) {
+              
+              logger.info('2-candle confirmation detected', {
+                timestamp: new Date().toISOString(),
+                latestScore: latestSignal.score,
+                prevScore: prevSignal.score,
+                timeDiffMinutes: timeDiff.toFixed(2),
+                signals: [
+                  { time: prevSignal.timestamp, score: prevSignal.score, price: prevSignal.price },
+                  { time: latestSignal.timestamp, score: latestSignal.score, price: latestSignal.price }
+                ]
+              });
+              
+              return {
+                confirmed: true,
+                score: ((latestSignal.score + prevSignal.score) / 2).toFixed(1),
+                reasons: [
+                  '✅ 2-candle confirmation:',
+                  `- Current candle score: ${latestSignal.score}`,
+                  `- Previous candle score: ${prevSignal.score}`,
+                  `- Time between signals: ${timeDiff.toFixed(2)} minutes`
+                ]
+              };
+            }
+            break; // Only check the most recent valid time difference
+          }
+        }
+      }
+    }
+    
+    return { 
+      confirmed: false,
+      pendingCount: this.pendingBuySignals.length,
+      pendingSignals: sortedSignals.map(s => ({
+        time: s.timestamp,
+        score: s.score,
+        price: s.price
+      }))
+    };
+  }
+
+  // Evaluate buy signal based on all conditions
+  async evaluateBuySignal(indicators) {
+    if (!indicators || typeof indicators !== 'object') {
+      logger.error('Invalid indicators object in evaluateBuySignal:', indicators);
+      return {
+        score: 0,
+        reasons: ['Invalid indicators data'],
+        confirmed: false
+      };
+    }
+    
+    const currentPrice = indicators.price;
+    if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+      logger.error('Invalid current price in evaluateBuySignal:', currentPrice);
+      return {
+        score: 0,
+        reasons: ['Invalid current price'],
+        confirmed: false
+      };
+    }
+    
+    const currentTime = new Date();
+    
+    // Calculate all score components
+    const techScore = this.calculateBuyScore(indicators);
+    const dipScore = this.calculateDipScore(currentPrice);
+    let low24hScore;
+    
+    try {
+      logger.debug(`Calculating 24h low score for price: ${currentPrice}`);
+      low24hScore = await this.calculate24hLowScore(currentPrice);
+    } catch (error) {
+      logger.error('Error calculating 24h low score:', error);
+      low24hScore = {
+        score: 0,
+        reasons: ['Error calculating 24h low score'],
+        low24h: 0,
+        currentPrice: currentPrice,
+        percentAbove24hLow: 0
+      };
+    }
+    
+    // Calculate total score (tech + dip + 24h low)
+    const maxPossibleScore = 21; // 8 (tech) + 3 (dip) + 10 (24h low)
+    const totalScore = Math.min(maxPossibleScore, techScore.score + dipScore.score + low24hScore.score);
+    
+    // Log detailed score information
+    logger.debug('Buy signal scores:', {
+      techScore: techScore.score,
+      dipScore: dipScore.score,
+      low24hScore: low24hScore.score,
+      totalScore: totalScore,
+      minRequired: this.buyConfig.minScore,
+      time: currentTime.toISOString()
+    });
+    
+    // Check if we have an active buy signal that needs to be monitored
+    if (this.activeBuySignal.isActive) {
+      const priceIncreasePct = ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice) * 100;
+      
+      // If price increased by 0.5% or more, cancel the buy signal
+      if (priceIncreasePct >= 0.5) {
+        logger.info('Cancelling buy signal due to price increase', {
+          signalPrice: this.activeBuySignal.signalPrice,
+          currentPrice,
+          increasePct: priceIncreasePct.toFixed(2) + '%',
+          confirmations: this.activeBuySignal.confirmations
+        });
+        
+        const cancelledSignal = {
+          techScore: techScore.score,
+          dipScore: dipScore.score,
+          totalScore: parseFloat(totalScore.toFixed(1)),
+          confirmed: false,
+          signalStatus: 'cancelled',
+          signalPrice: this.activeBuySignal.signalPrice,
+          priceIncreasePct: parseFloat(priceIncreasePct.toFixed(2)),
+          reasons: [
+            ...techScore.reasons,
+            ...dipScore.reasons,
+            '❌ Buy signal cancelled: Price increased by 0.5% or more after signal'
+          ]
+        };
+        
+        // Reset the active signal
+        this.activeBuySignal = {
+          isActive: false,
+          signalPrice: null,
+          signalTime: null,
+          confirmations: 0,
+          lastConfirmationTime: null
+        };
+        
+        return cancelledSignal;
+      }
+      
+      // If we have an active signal but the score dropped below threshold, reset it
+      if (techScore.score < this.buyConfig.minScore) {
+        logger.info('Resetting active signal due to score below threshold', {
+          currentScore: techScore.score,
+          minRequired: this.buyConfig.minScore
+        });
+        this.activeBuySignal = {
+          isActive: false,
+          signalPrice: null,
+          signalTime: null,
+          confirmations: 0,
+          lastConfirmationTime: null
+        };
+      }
+    }
+    
+    // Add to pending signals if total score is good enough
+    if (totalScore >= this.buyConfig.minScore) {
+      const newSignal = {
+        ...techScore,
+        price: currentPrice,
+        timestamp: currentTime.toISOString(),
+        score: totalScore, // Use total score instead of just tech score
+        dipScore: dipScore.score,
+        low24hScore: low24hScore.score
+      };
+      
+      // Log the new signal
+      logger.debug('New buy signal detected', {
+        timestamp: currentTime.toISOString(),
+        score: techScore.score,
+        price: currentPrice,
+        hasActiveSignal: this.activeBuySignal.isActive
+      });
+      
+      // If no active signal, this is a new signal
+      if (!this.activeBuySignal.isActive) {
+        this.activeBuySignal = {
+          isActive: true,
+          signalPrice: currentPrice,
+          signalTime: currentTime,
+          confirmations: 1,
+          lastConfirmationTime: currentTime,
+          orderIds: []
+        };
+        logger.info('New buy signal activated', { 
+          price: currentPrice,
+          score: techScore.score 
+        });
+      } else {
+        // Only increment confirmation if this is a new candle (at least 1 minute since last confirmation)
+        const minutesSinceLastConfirmation = (currentTime - this.activeBuySignal.lastConfirmationTime) / 60000;
+        if (minutesSinceLastConfirmation >= 1) {
+          this.activeBuySignal.confirmations = Math.min(2, this.activeBuySignal.confirmations + 1);
+          this.activeBuySignal.lastConfirmationTime = currentTime;
+          logger.debug('Incremented confirmation count', {
+            confirmations: this.activeBuySignal.confirmations,
+            minutesSinceLastConfirmation: minutesSinceLastConfirmation.toFixed(2)
+          });
+        }
+      }
+      
+      // Add to pending signals for 2-candle confirmation
+      this.pendingBuySignals.push(newSignal);
+      logger.debug('Added to pending signals', { 
+        totalPending: this.pendingBuySignals.length,
+        score: techScore.score 
+      });
+    }
+    
+    // Check for 2-candle confirmation
+    const confirmation = this.getTwoCandleConfirmation();
+    const isConfirmed = (confirmation.confirmed || 
+                      (this.activeBuySignal.isActive && this.activeBuySignal.confirmations >= 2)) && 
+                      totalScore >= this.buyConfig.minScore;
+    
+    // If we have a confirmed signal, execute the buy order immediately
+    if (isConfirmed && this.activeBuySignal.isActive) {
+      this.activeBuySignal.confirmations = 2; // Ensure we have 2 confirmations
+      this.activeBuySignal.lastConfirmationTime = currentTime;
+      
+      // Log the confirmation
+      logger.info('2-candle buy signal confirmed, executing buy order', {
+        price: this.activeBuySignal.signalPrice,
+        currentPrice,
+        confirmations: this.activeBuySignal.confirmations,
+        score: totalScore,
+        timestamp: currentTime.toISOString()
+      });
+      
+      // Execute buy order immediately
+      try {
+        await this.placeBuyOrder(currentPrice, 'CONFIRMED');
+      } catch (error) {
+        logger.error('Failed to execute buy order after confirmation:', error);
+      }
+    }
+    
+    // Combine all reasons for logging
+    const allReasons = [
+      `=== Buy Signal ===`,
+      `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${low24hScore.score}/10 (24h Low) = ${totalScore}/21`,
+      `⚪ Status: ${isConfirmed ? '✅ Confirmed' : this.activeBuySignal.isActive ? '⏳ Pending' : 'No Signal'}`,
+      `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || 'N/A'}% above)`,
+      '---',
+      ...techScore.reasons.filter(r => !r.includes('Score:')),
+      ...dipScore.reasons.filter(r => !r.includes('Score:')),
+      ...low24hScore.reasons.filter(r => !r.includes('Score:') && !r.includes('24h Low:')),
+      this.activeBuySignal.isActive 
+        ? `⏳ Signal active (${this.activeBuySignal.confirmations}/2 confirmations, ${((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2)}% from signal)`
+        : 'No active signal',
+      isConfirmed ? '✅ 2-candle confirmation' : '',
+      `Pending signals in queue: ${this.pendingBuySignals.length}`,
+      `===========================`
+    ].filter(Boolean); // Remove any empty strings
+
+    return {
+      techScore: techScore.score,
+      dipScore: dipScore.score,
+      low24hScore: low24hScore.score,
+      totalScore: parseFloat(totalScore.toFixed(1)),
+      confirmed: isConfirmed || (this.activeBuySignal.isActive && this.activeBuySignal.confirmations >= 2),
+      signalStatus: this.activeBuySignal.isActive ? 'active' : 'inactive',
+      signalPrice: this.activeBuySignal.signalPrice,
+      confirmations: this.activeBuySignal.confirmations,
+      reasons: allReasons,
+      // Include additional data for debugging
+      _24hLow: low24hScore.low24h,
+      percentAbove24hLow: low24hScore.percentAbove24hLow,
+      pendingSignalsCount: this.pendingBuySignals.length
+    };
+  }
+
+  /**
+   * Format price or amount with appropriate decimal precision
+   * @param {number|string} price - The value to format
+   * @param {string} currency - The currency code (e.g., 'USDC', 'SYRUP', 'USD')
+   * @returns {string} Formatted string with appropriate decimal places
+   */
+  formatPrice(price, currency = 'USD') {
+    // Handle undefined, null, or empty values
+    if (price === undefined || price === null || price === '') {
+      return '0.0';
+    }
+    
+    // Convert to number if it's a string
+    const num = typeof price === 'string' ? parseFloat(price) : Number(price);
+    
+    // Handle invalid numbers
+    if (isNaN(num)) {
+      logger.warn(`Invalid number format for ${currency}: ${price}`);
+      return '0.0';
+    }
+    
+    // Special formatting for specific currencies
+    if (currency === 'USDC' || currency === 'USD') {
+      // USDC: 4 decimal places for consistency with Coinbase
+      return num.toFixed(4);
+    } else if (currency === 'SYRUP') {
+      // SYRUP: 1 decimal place as per requirements
+      return num.toFixed(1);
+    }
+    
+    // Default formatting for other currencies
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency === 'USD' ? 'USD' : 'XXX',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 8
+    }).format(num) + (currency === 'USD' ? '' : ` ${currency}`);
+  }
+
+  formatTimestamp(timestamp) {
+    try {
+      // Convert to Date object using our utility function
+      const date = new Date(parseTimestamp(timestamp) * 1000 || Date.now());
+      
+      // Format as DD-MM-YY | HH:MM:SS
+      const day = String(date.getDate()).padStart(2, '0');
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const year = String(date.getFullYear()).slice(-2);
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      const seconds = String(date.getSeconds()).padStart(2, '0');
+      
+      return `${day}-${month}-${year} | ${hours}:${minutes}:${seconds}`;
+    } catch (error) {
+      logger.warn('Error formatting timestamp, using current time', { error });
+      // Return current time in a safe format
+      const now = new Date();
+      return now.toISOString().replace('T', ' ').replace(/\..+/, '');
+    }
+  }
+  
+  async logTradeCycle() {
+    if (this.candles.length === 0) {
+      logger.warn('No candle data available for trade cycle');
+      return;
+    }
+    
+    try {
+      const latestCandle = this.candles[this.candles.length - 1];
+      const formatNumber = (value, decimals = 4) => 
+        typeof value === 'number' ? value.toFixed(decimals) : 'N/A';
+      
+      // Calculate price change since last candle if available
+      let priceChange = 'N/A';
+      let priceChangePercent = 'N/A';
+      let priceChangeSymbol = '';
+      
+      if (this.candles.length >= 2) {
+        const currentClose = latestCandle.close;
+        const previousClose = this.candles[this.candles.length - 2].close;
+        priceChange = (currentClose - previousClose).toFixed(8);
+        priceChangePercent = ((currentClose - previousClose) / previousClose * 100).toFixed(2);
+        priceChangeSymbol = currentClose >= previousClose ? '📈' : '📉';
+      }
+      
+      const currentTime = new Date();
+      const formattedTime = this.formatTimestamp(currentTime);
+      const candleTime = this.formatTimestamp(latestCandle.time * 1000);
+      
+      // Format indicators
+      const emaValue = this.indicators.ema ? parseFloat(this.indicators.ema) : 0;
+      const rsiValue = this.indicators.rsi ? parseFloat(this.indicators.rsi) : 0;
+      const stochK = this.indicators.stochK ? parseFloat(this.indicators.stochK) : 0;
+      const stochD = this.indicators.stochD ? parseFloat(this.indicators.stochD) : 0;
+      const bbUpper = this.indicators.bbUpper ? parseFloat(this.indicators.bbUpper) : 0;
+      const bbMiddle = this.indicators.bbMiddle ? parseFloat(this.indicators.bbMiddle) : 0;
+      const bbLower = this.indicators.bbLower ? parseFloat(this.indicators.bbLower) : 0;
+      const macdHist = this.indicators.macd ? parseFloat(this.indicators.macd) : 0;
+      const macdSignal = this.indicators.macdSignal ? parseFloat(this.indicators.macdSignal) : 0;
+      const macdLine = this.indicators.macdLine ? parseFloat(this.indicators.macdLine) : 0;
+      
+      // Determine if price is above or below EMA
+      const priceVsEma = latestCandle.close > emaValue ? 'ABOVE' : 'BELOW';
+      const emaDiffPercent = ((latestCandle.close - emaValue) / emaValue * 100).toFixed(2);
+      
+      // Calculate buy signal
+      const buySignal = await this.evaluateBuySignal({
+        ema: emaValue,
+        rsi: rsiValue,
+        stochK: stochK,
+        stochD: stochD,
+        bb: { upper: bbUpper, middle: bbMiddle, lower: bbLower },
+        macd: { histogram: macdHist, signal: macdSignal, MACD: macdLine },
+        price: latestCandle.close
+      });
+      
+      // Format buy signal info
+      let statusEmoji = '⚪';
+      let statusText = 'No Signal';
+      
+      if (buySignal.signalStatus === 'cancelled') {
+        statusEmoji = '❌';
+        statusText = `Cancelled (${buySignal.priceIncreasePct}% increase)`;
+      } else if (buySignal.signalStatus === 'active') {
+        statusEmoji = '🟡';
+        statusText = `Active (${buySignal.confirmations}/2 confirmations)`;
+        
+        // Show price change from signal price if available
+        if (buySignal.signalPrice) {
+          const pctChange = ((latestCandle.close - buySignal.signalPrice) / buySignal.signalPrice * 100).toFixed(2);
+          statusText += `, ${pctChange}% from signal`;
+        }
+      } else if (buySignal.confirmed) {
+        statusEmoji = '🟢';
+        statusText = 'Confirmed';
+      }
+      
+      // Filter out duplicate reasons that we're handling separately
+      const filteredReasons = buySignal.reasons.filter(r => 
+        !r.includes('2-candle confirmation') && 
+        !r.includes('Signal active') &&
+        !r.includes('Waiting for confirmation')
+      );
+      
+      const buySignalInfo = [
+        '=== Buy Signal ===',
+        `📊 Score: ${buySignal.techScore}/8 (Tech) + ${buySignal.dipScore}/3 (Dip) + ${buySignal.low24hScore}/10 (24h Low) = ${buySignal.totalScore}/21`,
+        `${statusEmoji} Status: ${statusText}`,
+        ...(buySignal.signalPrice ? [`Signal Price: ${this.formatPrice(buySignal.signalPrice)}`] : []),
+        ...(buySignal._24hLow ? [`24h Low: ${this.formatPrice(buySignal._24hLow)} (${buySignal.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`] : []),
+        ...(filteredReasons.length > 0 ? ['---', ...filteredReasons] : []),
+        ...(buySignal.confirmed ? ['✅ 2-candle confirmation'] : [])
+      ].filter(line => line).join('\n');
+      
+      // Create log message
+      const logMessage = [
+        `\n=== ${formattedTime} ===`,
+        `📊 ${this.tradingPair} - ${candleTime.split(' ')[1]}`,
+        `💵 Price: ${this.formatPrice(latestCandle.close, this.quoteCurrency)} ${priceChangeSymbol} ${priceChange} (${priceChangePercent}%)`,
+        `📈 High: ${this.formatPrice(latestCandle.high, this.quoteCurrency)} | 📉 Low: ${this.formatPrice(latestCandle.low, this.quoteCurrency)}`,
+        `📊 Volume: ${formatNumber(latestCandle.volume, 2)} ${this.baseCurrency}`,
+        '--- TECHNICAL INDICATORS ---',
+        `📈 EMA(${config.indicators.ema.period}): ${this.formatPrice(emaValue, this.quoteCurrency)} (${priceVsEma} by ${Math.abs(emaDiffPercent)}%)`,
+        `📊 RSI(${config.indicators.rsi.period}): ${formatNumber(rsiValue, 2)} ${rsiValue > 70 ? '🔴' : rsiValue < 30 ? '🟢' : '⚪'}`,
+        `📊 Stoch K/D(${config.indicators.stoch.period}): ${formatNumber(stochK, 1)} / ${formatNumber(stochD, 1)} ${stochK > 80 || stochD > 80 ? '🔴' : stochK < 20 || stochD < 20 ? '🟢' : '⚪'}`,
+        `📊 BB(${config.indicators.bb.period}): ${this.formatPrice(bbUpper, this.quoteCurrency)} | ${this.formatPrice(bbMiddle, this.quoteCurrency)} | ${this.formatPrice(bbLower, this.quoteCurrency)}`,
+        `📊 MACD: ${formatNumber(macdLine, 6)} | Signal: ${formatNumber(macdSignal, 6)} | Hist: ${formatNumber(macdHist, 6)}`,
+        '--- BUY SIGNAL ---',
+        buySignalInfo,  // Use the formatted buySignalInfo we created earlier
+        '==========================='
+      ].join('\n');
+      
+      // Log to console
+      console.log(logMessage);
+      
+      // Log trade cycle to file
+      try {
+        // Create a simplified version for the log file
+        const logEntry = {
+          timestamp: currentTime.toISOString(),
+          price: latestCandle.close,
+          indicators: {
+            ema: emaValue,
+            rsi: rsiValue,
+            stoch: { k: stochK, d: stochD },
+            bb: { upper: bbUpper, middle: bbMiddle, lower: bbLower },
+            macd: { line: macdLine, signal: macdSignal, histogram: macdHist }
+          },
+          priceChange: {
+            amount: parseFloat(priceChange),
+            percent: parseFloat(priceChangePercent)
+          },
+          buySignal: {
+            score: buySignal.score,
+            status: buySignal.signalStatus || 'none',
+            confirmations: buySignal.confirmations || 0,
+            reasons: buySignal.reasons || []
+          }
+        };
+        
+        // Log to the trade cycle log file with a specific message to filter by
+      logger.log({ 
+        level: 'info',
+        message: 'TRADE_CYCLE',
+        ...logEntry 
+      });
+      } catch (logError) {
+        console.error('Error logging trade cycle to file:', logError);
+      }
+      
+    } catch (error) {
+      logger.error('Error in logTradeCycle:', error);
+      console.error('Error logging trade cycle:', error.message);
+    }
+  }
+  
+  /**
+   * Check and execute trades based on signals
+   */
+  async checkAndExecuteTrades() {
+    try {
+      // Check for manual buys first
+      await this.checkForManualBuys();
+      
+      // Then check for automated trading signals
+      if (this.candles.length < 20) {
+        logger.warn('Not enough candle data to check for trades');
+        return;
+      }
+      
+      // Calculate indicators
+      this.calculateIndicators();
+      
+      // Check for buy signals - this will now handle the buy execution immediately upon confirmation
+      const signalResult = await this.evaluateBuySignal(this.indicators);
+      
+      // If we have a confirmed signal, the buy order was already executed in evaluateBuySignal
+      if (signalResult && signalResult.score >= this.buyConfig.minScore && signalResult.confirmed) {
+        logger.info('Buy order execution handled in signal evaluation');
+      }
+      
+    } catch (error) {
+      logger.error('Error in checkAndExecuteTrades:', error);
+    }
+  }
+  
+  /**
+   * Place a limit sell order after a successful buy
+   * @param {number} buyPrice - Price at which the asset was bought
+   * @param {number} amount - Amount of base currency to sell
+   * @returns {Promise<Object|null>} Order response or null if failed
+   */
+  async placeLimitSellOrder(buyPrice, amount) {
+    try {
+      if (!amount || amount <= 0) {
+        logger.warn('Invalid amount for limit sell order');
+        return null;
+      }
+
+      // Calculate sell price with 3.5% profit
+      const sellPrice = buyPrice * 1.035;
+      const formattedAmount = amount.toFixed(8);
+      
+      logger.info(`Placing limit sell order for ${formattedAmount} ${this.baseCurrency} ` +
+                 `@ ${sellPrice.toFixed(8)} ${this.quoteCurrency} (3.5% above buy price)`);
+      
+      // Place the limit sell order (GTC - Good Till Cancelled)
+      const orderResponse = await coinbaseService.submitOrder(
+        this.tradingPair,
+        'SELL',
+        formattedAmount,
+        'limit',
+        sellPrice,
+        true  // Post-only to ensure maker order
+      );
+      
+      if (orderResponse?.order_id) {
+        logger.info(`Limit sell order placed. ID: ${orderResponse.order_id}`);
+        
+        // Log the sell order details
+        this.logTrade('SELL_LIMIT', sellPrice, amount * sellPrice, {
+          ...orderResponse,
+          filled_size: formattedAmount,
+          executed_value: (amount * sellPrice).toFixed(8)
+        });
+        
+        return orderResponse;
+      } else {
+        throw new Error('Invalid response when placing limit sell order');
+      }
+    } catch (error) {
+      logger.error('Error placing limit sell order:', error.message || error);
+      if (error.response?.data) {
+        logger.error('Error details:', error.response.data);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Place a buy order and handle the response with confirmation
+   * @param {number} price - Current price
+   * @param {string} type - Type of buy (INITIAL, DCA, or CONFIRMED)
+   * @returns {Promise<Object|null>} Order response or null if failed
+   */
+  async placeBuyOrder(price, type = 'INITIAL') {
+    const orderStartTime = Date.now();
+    const orderLabel = `[${type} BUY]`;
+    let positionSize = 0; // Initialize positionSize at the beginning
+    
+    try {
+      // 1. Check if we're in cooldown period
+      const timeSinceLastBuy = Date.now() - this.lastBuyTime;
+      if (timeSinceLastBuy < this.buyCooldown) {
+        const remainingMs = this.buyCooldown - timeSinceLastBuy;
+        logger.warn(`${orderLabel} Cooldown active. ${Math.ceil(remainingMs/1000)}s remaining.`);
+        return null;
+      }
+      
+      // 2. Check account balance and calculate position size
+      await this.getAccountBalances();
+      const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
+      
+      // 2.1 Check if we have enough balance for minimum trade size
+      if (quoteBalance < this.buyConfig.minPositionSize) {
+        logger.warn(`${orderLabel} Insufficient ${this.quoteCurrency} balance. ` +
+                   `Available: ${this.formatPrice(quoteBalance, this.quoteCurrency)} ${this.quoteCurrency}, ` +
+                   `Minimum required: ${this.formatPrice(this.buyConfig.minPositionSize, this.quoteCurrency)} ${this.quoteCurrency}`);
+        
+        // Log this as a skipped trade due to insufficient funds
+        this.logTrade('BUY_SKIPPED', price, 0, {
+          reason: `Insufficient ${this.quoteCurrency} balance`,
+          available: quoteBalance,
+          required: this.buyConfig.minPositionSize,
+          timestamp: new Date().toISOString()
+        });
+        
+        return null;
+      }
+      
+      // 3. Calculate position size based on available balance
+      positionSize = quoteBalance * (this.buyConfig.positionSizePercent / 100);
+      
+      // Ensure position size is at least the minimum and not more than available balance
+      positionSize = Math.max(
+        Math.min(positionSize, quoteBalance), // Don't exceed available balance
+        this.buyConfig.minPositionSize // At least 7 USDC
+      );
+      
+      // Format the position size and price for display
+      const formattedPositionSize = this.formatPrice(positionSize, this.quoteCurrency);
+      const formattedPrice = this.formatPrice(price, this.quoteCurrency);
+      logger.info(`${orderLabel} Placing market order for ${formattedPositionSize} ${this.quoteCurrency} @ ~${formattedPrice} ${this.quoteCurrency}...`);
+      
+      // 4. Place the market order using the coinbase service
+      let orderResponse;
+      try {
+        orderResponse = await coinbaseService.submitOrder(
+          this.tradingPair,
+          'BUY',
+          positionSize.toString(),
+          'market'
+        );
+        
+        if (!orderResponse?.order_id) {
+          throw new Error('Invalid order response: missing order_id');
+        }
+        
+        const orderId = orderResponse.order_id;
+        logger.info(`${orderLabel} Order placed. ID: ${orderId}`);
+        
+        // 5. Wait briefly for order to be filled
+        logger.debug('Waiting for order to be filled...');
+        await new Promise(resolve => setTimeout(resolve, 1500)); // Increased to 1.5s for better reliability
+        
+        // 6. Get order details to confirm fill
+        let orderDetails;
+        try {
+          orderDetails = await this.client.getOrder(orderId);
+          
+          // 7. Verify order was filled
+          if (orderDetails?.status !== 'FILLED') {
+            throw new Error(`Order not filled. Status: ${orderDetails?.status || 'UNKNOWN'}`);
+          }
+          
+          // 8. Calculate filled amount and price
+          const filledSize = parseFloat(orderDetails.filled_size || '0');
+          const filledValue = parseFloat(orderDetails.executed_value || '0');
+          const actualPrice = filledSize > 0 ? (filledValue / filledSize) : 0;
+          
+          if (filledSize <= 0 || filledValue <= 0) {
+            throw new Error(`Invalid fill amounts - size: ${filledSize}, value: ${filledValue}`);
+          }
+          
+          // Format the filled size and price according to currency standards
+          const formattedFilledSize = this.formatPrice(filledSize, this.baseCurrency);
+          const formattedActualPrice = this.formatPrice(actualPrice, this.quoteCurrency);
+          logger.info(`${orderLabel} Order filled. ${formattedFilledSize} ${this.baseCurrency} @ ${formattedActualPrice} ${this.quoteCurrency}`);
+          
+          // 9. Log the successful buy
+          this.logTrade('BUY', actualPrice, filledValue, orderDetails);
+          
+          // 10. Update the active buy signal with this purchase
+          this.updateBuySignalAfterOrder(actualPrice, filledValue, orderDetails);
+          this.lastBuyTime = Date.now();
+          
+          // 11. Place a limit sell order for this buy (3.5% profit target)
+          if (filledSize > 0) {
+            try {
+              const formattedSellSize = this.formatPrice(filledSize, this.baseCurrency);
+              logger.info(`Placing limit sell order for ${formattedSellSize} ${this.baseCurrency}...`);
+              const sellOrder = await this.placeLimitSellOrder(actualPrice, filledSize);
+              if (sellOrder) {
+                logger.info(`Limit sell order placed successfully. ID: ${sellOrder.order_id}`);
+              } else {
+                logger.warn('Failed to place limit sell order (returned null)');
+              }
+            } catch (sellError) {
+              logger.error('Failed to place limit sell order after buy:', sellError);
+              // Even if sell order fails, we still consider the buy successful
+            }
+          }
+          
+          // 12. Check for any manual buys that might have happened
+          await this.checkForManualBuys();
+          
+          return orderDetails;
+          
+        } catch (confirmError) {
+          // If we can't confirm the order status, log the error but still try to proceed
+          logger.error(`${orderLabel} Error confirming order ${orderId}:`, confirmError);
+          
+          // Log the buy with the information we have
+          this.logTrade('BUY', price, positionSize, orderResponse || {});
+          this.updateBuySignalAfterOrder(price, positionSize, orderResponse || {});
+          this.lastBuyTime = Date.now();
+          
+          return orderResponse || { status: 'UNCONFIRMED', order_id: `unconfirmed-${Date.now()}` };
+        }
+        
+      } catch (orderError) {
+        logger.error(`${orderLabel} Failed to place order:`, orderError.message || orderError);
+        
+        // Log the failed order attempt
+        this.logTrade('BUY_FAILED', price, positionSize, { 
+          error: orderError.message,
+          timestamp: new Date().toISOString()
+        });
+        
+        // If we're rate limited, apply backoff
+        if (orderError.response?.status === 429) {
+          const retryAfter = parseInt(orderError.response.headers['retry-after'] || '5', 10) * 1000;
+          logger.warn(`Rate limited. Waiting ${retryAfter}ms before next attempt...`);
+          this.lastBuyTime = Date.now() + retryAfter - this.buyCooldown;
+        }
+        
+        return null;
+      }
+      
+    } catch (error) {
+      const errorDetails = error.response?.data || error.message;
+      logger.error(`${orderLabel} Failed to place order:`, errorDetails);
+      
+      // Log the failed attempt for analysis
+      this.logTrade('BUY_FAILED', price, positionSize, { 
+        error: error.message,
+        timestamp: new Date().toISOString()
+      });
+      
+      // If we have a rate limit error, apply backoff
+      if (error.response?.status === 429) {
+        const retryAfter = parseInt(error.response.headers['retry-after'] || '5', 10) * 1000;
+        logger.warn(`Rate limited. Waiting ${retryAfter}ms before next attempt...`);
+        this.lastBuyTime = Date.now() + retryAfter - this.buyCooldown;
+      }
+      
+      return null;
+    }
+  }
+  
+  /**
+   * Check for manual buys by comparing actual balance with expected position
+   */
+  async checkForManualBuys() {
+    try {
+      // Don't check too frequently
+      const now = Date.now();
+      if (now - this.lastManualBuyCheck < this.manualBuyCheckInterval) {
+        return;
+      }
+      
+      this.lastManualBuyCheck = now;
+      
+      // Get current account balances
+      await this.getAccountBalances();
+      const currentBalance = parseFloat(this.accounts[this.baseCurrency]?.available || 0);
+      
+      // If we have an active position, check for manual buys
+      if (this.activeBuySignal.isActive) {
+        const expectedBalance = this.activeBuySignal.totalQuantity;
+        
+        // If current balance is significantly higher than expected, log a manual buy
+        if (currentBalance > expectedBalance * 1.01) { // 1% threshold to account for floating point
+          const manualBuyAmount = currentBalance - expectedBalance;
+          logger.warn(`Detected manual buy of ${manualBuyAmount.toFixed(8)} ${this.baseCurrency}. Updating position...`);
+          
+          // Update the active buy signal as if this was a DCA buy
+          this.updateBuySignalAfterOrder(
+            this.activeBuySignal.lastBuyPrice, // Use last buy price as an estimate
+            manualBuyAmount * this.activeBuySignal.lastBuyPrice,
+            { order_id: `manual-buy-${Date.now()}` }
+          );
+        }
+      }
+    } catch (error) {
+      logger.error('Error checking for manual buys:', error);
+    }
+  }
+
+  /**
+   * Update the active buy signal after a successful order
+   * @param {number} price - Price of the order
+   * @param {number} amount - Amount in quote currency
+   * @param {Object} orderResponse - Order response from the exchange
+   */
+  updateBuySignalAfterOrder(price, amount, orderResponse) {
+    try {
+      const orderId = orderResponse?.order_id || `manual-${Date.now()}`;
+      const filledSize = parseFloat(orderResponse?.filled_size || (amount / price));
+      const filledValue = parseFloat(orderResponse?.executed_value || amount);
+      
+      // Skip if this is a sell order
+      if (orderResponse?.side === 'SELL' || orderResponse?.side === 'SELL_LIMIT') {
+        return;
+      }
+      
+      // If this is a new signal, initialize the activeBuySignal
+      if (!this.activeBuySignal.isActive) {
+        this.activeBuySignal = {
+          isActive: true,
+          signalPrice: price,
+          signalTime: Date.now(),
+          confirmations: 1,
+          lastConfirmationTime: Date.now(),
+          totalInvested: filledValue,
+          totalQuantity: filledSize,
+          averagePrice: price,
+          buyCount: 1,
+          lastBuyPrice: price,
+          orderIds: [orderId]
+        };
+      } else {
+        // Update existing signal
+        const newTotalInvested = this.activeBuySignal.totalInvested + filledValue;
+        const newTotalQuantity = this.activeBuySignal.totalQuantity + filledSize;
+        
+        this.activeBuySignal.totalInvested = newTotalInvested;
+        this.activeBuySignal.totalQuantity = newTotalQuantity;
+        this.activeBuySignal.averagePrice = newTotalInvested / newTotalQuantity;
+        this.activeBuySignal.buyCount++;
+        this.activeBuySignal.lastBuyPrice = price;
+        this.activeBuySignal.orderIds.push(orderId);
+        this.activeBuySignal.confirmations++;
+        this.activeBuySignal.lastConfirmationTime = Date.now();
+      }
+      
+      logger.info(`Buy order executed. Position: ${this.activeBuySignal.totalQuantity.toFixed(8)} ${this.baseCurrency} ` +
+                 `@ avg price ${this.activeBuySignal.averagePrice.toFixed(8)} ${this.quoteCurrency} ` +
+                 `(Total: ${this.activeBuySignal.totalInvested.toFixed(2)} ${this.quoteCurrency})`);
+      
+    } catch (error) {
+      logger.error('Error updating buy signal after order:', error);
+    }
+  }
+  
+  /**
+   * Reset the active buy signal
+   */
+  resetBuySignal() {
+    this.activeBuySignal = {
+      isActive: false,
+      signalPrice: null,
+      signalTime: null,
+      confirmations: 0,
+      lastConfirmationTime: null,
+      totalInvested: 0,
+      totalQuantity: 0,
+      averagePrice: 0,
+      buyCount: 0,
+      lastBuyPrice: 0,
+      orderIds: []
+    };
+  }
+  
+  /**
+   * Log a trade to the trade history
+   * @param {string} side - 'BUY' or 'SELL'
+   * @param {number} price - Price per unit
+   * @param {number} amount - Amount in quote currency
+   * @param {Object} orderResponse - Order response from the exchange
+   */
+  logTrade(side, price, amount, orderResponse) {
+    try {
+      const trade = {
+        timestamp: Date.now(),
+        side: side.toUpperCase(),
+        price: price,
+        amount: amount,
+        baseCurrency: this.baseCurrency,
+        quoteCurrency: this.quoteCurrency,
+        orderId: orderResponse?.order_id || `manual-${Date.now()}`,
+        filledSize: parseFloat(orderResponse?.filled_size || (amount / price)),
+        executedValue: parseFloat(orderResponse?.executed_value || amount),
+        fees: parseFloat(orderResponse?.fill_fees || 0),
+        status: orderResponse?.status || 'filled'
+      };
+      
+      this.tradeHistory.push(trade);
+      
+      // Log the trade to file
+      logger.info('TRADE_EXECUTED', trade);
+      
+      return trade;
+      
+    } catch (error) {
+      logger.error('Error logging trade:', error);
+    }
+  }
+
+  /**
+   * Calculate the number of milliseconds until the next minute starts
+   * @returns {number} Milliseconds until the next minute
+   */
+  getMsToNextMinute() {
+    const now = new Date();
+    // Calculate milliseconds until next full minute (aligned to system clock)
+    const msToNextMinute = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+    // Ensure we don't return 0 or negative values, but keep it close to the actual time
+    return Math.max(10, msToNextMinute);
+  }
+
+  /**
+   * Wait until 500ms after the next minute starts (aligned to system clock)
+   * This ensures candle data is available before processing
+   */
+  async waitForNextMinute() {
+    const now = new Date();
+    
+    // Calculate milliseconds until next minute boundary
+    const msToNextMinute = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+    
+    // Add 500ms to get to 500ms after the minute
+    const msToWait = msToNextMinute + 500;
+    
+    // Calculate the target time for logging
+    const targetTime = new Date(now.getTime() + msToWait);
+    
+    logger.debug(`Waiting ${msToWait}ms until ${targetTime.toISOString()} (${msToNextMinute}ms to next minute + 500ms)`);
+    logger.debug(`Current time: ${now.toISOString()}`);
+    
+    // Wait until the target time
+    if (msToWait > 0) {
+      await new Promise(resolve => setTimeout(resolve, msToWait));
+    } else {
+      // If for some reason we calculated a negative wait time, just wait until next minute + 500ms
+      const nextMinute = new Date(now);
+      nextMinute.setMinutes(nextMinute.getMinutes() + 1, 0, 500);
+      const fallbackWait = nextMinute.getTime() - now.getTime();
+      logger.debug(`Fallback wait: ${fallbackWait}ms to ${nextMinute.toISOString()}`);
+      await new Promise(resolve => setTimeout(resolve, fallbackWait));
+    }
+    
+    // Log the actual time after waiting
+    const afterWait = new Date();
+    const actualWait = afterWait.getTime() - now.getTime();
+    const drift = afterWait.getTime() - targetTime.getTime();
+    
+    logger.debug(`Resumed at: ${afterWait.toISOString()} ` +
+                 `(target: ${targetTime.toISOString()}, ` +
+                 `expected wait: ${msToWait}ms, ` +
+                 `actual wait: ${actualWait}ms, ` +
+                 `drift: ${drift}ms)`);
+  }
+
+  async startTradingCycle() {
+    if (this.isRunning) {
+      logger.warn('Trading cycle already running');
+      return;
+    }
+
+    try {
+      console.log('\n=== Loading Initial Data ===');
+      
+      // Load and display account balances first
+      console.log('Fetching account balances...');
+      await this.loadAccounts();
+      
+      // Display account balances using formatPrice for consistent decimal places
+      const baseBalance = parseFloat(this.accounts[this.baseCurrency]?.balance || 0);
+      const baseAvailable = parseFloat(this.accounts[this.baseCurrency]?.available || 0);
+      const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.balance || 0);
+      const quoteAvailable = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
+      
+      console.log('\n=== ACCOUNT BALANCES ===');
+      console.log(`${this.baseCurrency.padEnd(8)}: ${this.formatPrice(baseBalance, this.baseCurrency)} (Available: ${this.formatPrice(baseAvailable, this.baseCurrency)})`);
+      console.log(`${this.quoteCurrency.padEnd(8)}: ${this.formatPrice(quoteBalance, this.quoteCurrency)} (Available: ${this.formatPrice(quoteAvailable, this.quoteCurrency)})`);
+      console.log('========================\n');
+
+      // Ensure we have candles before starting the trading cycle
+      if (this.candles.length === 0) {
+        console.log('Fetching initial candle data...');
+        await this.fetchInitialCandles();
+        if (this.candles.length === 0) {
+          throw new Error('Failed to fetch initial candles');
+        }
+        
+        // Load initial hourly candles
+        console.log('Fetching initial hourly candle data...');
+        await this.updateHourlyCandles(true); // Force update during initialization
+        if (this.hourlyCandles.length === 0) {
+          logger.warn('No hourly candles available, 24h low calculation will be less accurate');
+        } else {
+          logger.info(`Successfully loaded ${this.hourlyCandles.length} hours of candle data for 24h low calculation`);
+        }
+      }
+
+      this.isRunning = true;
+      logger.info('=== Starting Trading Cycle ===');
+      logger.info('Bot is now running. Press Ctrl+C to stop.');
+      
+      // Handle process termination
+      process.on('SIGINT', async () => {
+        console.log('\nStopping trading bot...');
+        this.isRunning = false;
+        if (this.cycleTimeout) {
+          clearTimeout(this.cycleTimeout);
+        }
+        console.log('Trading bot stopped.');
+        process.exit(0);
+      });
+      
+      // Initial wait to align with the next minute + 500ms
+      await this.waitForNextMinute();
+      
+      // Main trading loop
+      this.tradingLoop();
+    } catch (error) {
+      logger.error('Failed to start trading cycle:', error);
+      this.isRunning = false;
+    }
+
+  }
+
+  async tradingLoop() {
+    let lastHourlyUpdate = Date.now();
+    let cycleError = null;
+    
+    while (this.isRunning) {
+      const cycleStart = Date.now();
+      const currentTime = Date.now();
+      cycleError = null; // Reset error at the start of each cycle
+      
+      try {
+        // Check for manual buys
+        await this.checkForManualBuys();
+        
+        // Fetch latest candle data
+        await this.fetchCandleData();
+        
+        // Only proceed if we have candles
+        if (this.candles.length > 0) {
+          // Calculate indicators
+          this.calculateIndicators();
+          
+          // Update hourly candles if an hour has passed since last update
+          if (currentTime - lastHourlyUpdate >= 3600000) { // 1 hour in ms
+            await this.updateHourlyCandles(true);
+            lastHourlyUpdate = currentTime;
+          }
+          
+          // Log the trading cycle
+          await this.logTradeCycle();
+          
+          // Check and execute trades
+          await this.checkAndExecuteTrades();
+        } else {
+          logger.warn('No candle data available for trade cycle');
+        }
+      } catch (error) {
+        cycleError = error;
+        logger.error('Error in trading cycle:', error);
+      }
+      
+      // Calculate time until next cycle (next minute + 500ms)
+      const cycleEndTime = Date.now();
+      const nextCycleTime = Math.ceil((cycleEndTime + 500) / 60000) * 60000 + 500;
+      const timeToWait = Math.max(0, nextCycleTime - cycleEndTime);
+      
+      // Log timing information
+      const cycleDuration = cycleEndTime - cycleStart;
+      logger.debug(`Cycle completed in ${cycleDuration}ms. ` +
+                  `Waiting ${timeToWait}ms until next cycle at ${new Date(nextCycleTime).toISOString()}`);
+      
+      // Wait until next cycle time
+      if (timeToWait > 0) {
+        await new Promise(resolve => setTimeout(resolve, timeToWait));
+      }
+      
+      // If there was an error, add some additional cooldown
+      if (cycleError) {
+        const errorCooldown = 5000; // 5 seconds additional cooldown on error
+        logger.debug(`Adding ${errorCooldown}ms cooldown due to error in previous cycle`);
+        await new Promise(resolve => setTimeout(resolve, errorCooldown));
+        logger.debug(`Adding ${errorCooldown}ms cooldown due to error`);
+        await new Promise(resolve => setTimeout(resolve, errorCooldown));
+      }
+    }
+    
+    // Final cleanup
+    this.isRunning = false;
+    logger.info('Trading cycle stopped');
+  }
+
+  async getAccountBalances() {
+    try {
+      logger.info('Fetching account balances...');
+      
+      // Get all accounts
+      const response = await this.client.getAccounts();
+      
+      const accounts = response.accounts || [];
+      
+      if (accounts.length === 0) {
+        logger.warn('No accounts found');
+        return {};
+      }
+      
+      // Log all account currencies for debugging
+      const accountCurrencies = [...new Set(accounts.map(acc => acc.currency))];
+      logger.debug(`Available account currencies: ${accountCurrencies.join(', ')}`);
+      
+      // Log raw account data for debugging
+      logger.debug('Raw account data:', JSON.stringify(accounts, null, 2));
+      
+      // Filter for configured base and quote currency accounts
+      const filteredAccounts = {};
+      const foundCurrencies = [];
+      
+      for (const account of accounts) {
+        if ([this.baseCurrency, this.quoteCurrency].includes(account.currency)) {
+          // Try different property names for balance
+          const availableBalance = account.available_balance?.value || 
+                                 account.available_balance || 
+                                 account.balance?.available || 
+                                 '0';
+          
+          const holdBalance = account.hold?.value || 
+                            account.hold || 
+                            account.balance?.hold || 
+                            '0';
+          
+          // Parse and validate the balance values
+          const available = parseFloat(availableBalance);
+          const hold = parseFloat(holdBalance);
+          
+          if (isNaN(available) || isNaN(hold)) {
+            logger.warn(`Invalid balance values for ${account.currency}: available=${availableBalance}, hold=${holdBalance}`);
+            continue;
+          }
+          
+          // Format the balance based on currency type
+          const formattedAvailable = this.formatPrice(available, account.currency);
+          const formattedHold = this.formatPrice(hold, account.currency);
+          
+          filteredAccounts[account.currency] = {
+            available: formattedAvailable,
+            balance: formattedAvailable, // Using available as the main balance
+            hold: formattedHold
+          };
+          
+          foundCurrencies.push(account.currency);
+          logger.debug(`Processed account ${account.currency}: available=${formattedAvailable}, hold=${formattedHold}`);
+        }
+      }
+      
+      // Check if we found both required accounts
+      const missingCurrencies = [this.baseCurrency, this.quoteCurrency].filter(
+        curr => !foundCurrencies.includes(curr)
+      );
+      
+      if (missingCurrencies.length > 0) {
+        logger.warn(`Missing required accounts for currencies: ${missingCurrencies.join(', ')}`);
+      } else {
+        logger.info(`Successfully loaded ${foundCurrencies.length} accounts: ${foundCurrencies.join(', ')}`);
+      }
+      
+      this.accounts = filteredAccounts;
+      return filteredAccounts;
+      
+    } catch (error) {
+      const errorMsg = `Failed to load accounts: ${error.message}`;
+      logger.error(errorMsg, { error });
+      throw new Error(errorMsg);
+    } finally {
+      // Clean up any resources if needed
+    }
+  }
+}
+
+
+// Format currency with symbol
+function formatCurrency(amount, currency) {
+  const formatter = new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: currency || 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 8
+  });
+  return formatter.format(amount);
+}
+
+// Main function
+async function main() {
+  try {
+    console.log('\n=== Starting SYRUP-USDC Trading Bot ===\n');
+    
+    const bot = new SyrupTradingBot();
+    
+    // Start the trading cycle
+    console.log('\n=== Starting Trading Cycle ===');
+    console.log('Bot is now running. Press Ctrl+C to stop.');
+    
+    // Handle process termination
+    process.on('SIGINT', async () => {
+      console.log('\nStopping trading bot...');
+      bot.isRunning = false;
+      if (bot.cycleTimeout) {
+        clearTimeout(bot.cycleTimeout);
+      }
+      console.log('Trading bot stopped.');
+      process.exit(0);
+    });
+    
+    // Start the trading cycle
+    await bot.startTradingCycle();
+    
+  } catch (error) {
+    console.error('\n❌ Error:', error.message);
+    if (error.response) {
+      console.error('API Error:', error.response.data || error.response.statusText);
+    }
+    process.exit(1);
+  }
+}
+
+// Run the bot
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch(console.error);
+}
+
+export default SyrupTradingBot;
