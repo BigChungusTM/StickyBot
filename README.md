@@ -1,4 +1,5 @@
 # SyrupBot Trading System
+Please Note: This is 100% Vibe Coded. There is a current task list with changes that is updated in planning steps that shows where current functionality sits.
 
 ## Overview
 SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRUP-USDC trading pair. The bot uses a sophisticated scoring system combining technical indicators, dip detection, and 24-hour low proximity to identify high-probability trading opportunities. It executes trades through the Coinbase Advanced Trade API.
