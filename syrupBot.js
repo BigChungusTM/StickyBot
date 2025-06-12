@@ -241,23 +241,52 @@ const config = {
   }
 };
 
+// Load environment variables
+dotenv.config();
+
+// Debug log environment variables
+console.log('=== Environment Variables ===');
+console.log('NODE_ENV:', process.env.NODE_ENV || 'not set');
+console.log('COINBASE_API_KEY_ID:', process.env.COINBASE_API_KEY_ID ? '*** (set)' : 'not set');
+console.log('COINBASE_API_SECRET:', process.env.COINBASE_API_SECRET ? '*** (set)' : 'not set');
+console.log('COINBASE_API_NICKNAME:', process.env.COINBASE_API_NICKNAME || 'not set');
+console.log('TRADING_PAIR:', process.env.TRADING_PAIR || 'not set');
+
 // Initialize Coinbase Advanced Trade client
-const client = new CBAdvancedTradeClient(
-  {
-    // API credentials from environment variables
-    apiKey: process.env.COINBASE_API_KEY || '',
-    apiSecret: process.env.COINBASE_API_SECRET || '',
-    // Optional: Set to true to use the sandbox environment
-    // sandbox: process.env.NODE_ENV !== 'production'
-  },
-  {
-    // Optional: Axios request config
-    timeout: 5000,
-    headers: {
-      'User-Agent': 'SYRUP-USDC-Trader/1.0'
+let client;
+try {
+  client = new CBAdvancedTradeClient(
+    {
+      // API credentials from environment variables
+      apiKey: process.env.COINBASE_API_KEY_ID || '',
+      apiSecret: process.env.COINBASE_API_SECRET || '',
+      // Add API nickname if needed
+      apiNickname: process.env.COINBASE_API_NICKNAME || 'SYRUP-Bot',
+      // Optional: Set to true to use the sandbox environment
+      // sandbox: process.env.NODE_ENV !== 'production',
+      // Add debug logging
+      logger: {
+        info: console.log,
+        error: console.error,
+        debug: console.debug,
+        warn: console.warn
+      }
+    },
+    {
+      // Optional: Axios request config
+      timeout: 10000, // Increased timeout to 10 seconds
+      headers: {
+        'User-Agent': 'SYRUP-USDC-Trader/1.0',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
     }
-  }
-);
+  );
+  console.log('Coinbase API client initialized successfully');
+} catch (error) {
+  console.error('Failed to initialize Coinbase API client:', error.message);
+  process.exit(1);
+}
 
 class SyrupTradingBot {
   constructor() {
@@ -1763,11 +1792,16 @@ class SyrupTradingBot {
         return cancelledSignal;
       }
       
-      // If we have an active signal but the score dropped below threshold, reset it
-      if (techScore.score < this.buyConfig.minScore) {
-        logger.info('Resetting active signal due to score below threshold', {
-          currentScore: techScore.score,
-          minRequired: this.buyConfig.minScore
+      // If we have an active signal but the total score dropped below threshold, reset it
+      // Only reset if the score is below the minimum threshold (e.g., 11/21)
+      if (totalScore < this.buyConfig.minScore) {
+        logger.info('Resetting active signal due to total score below threshold', {
+          currentTotalScore: totalScore,
+          minRequired: this.buyConfig.minScore,
+          techScore: techScore.score,
+          dipScore: dipScore.score,
+          low24hScore: low24hScore.score,
+          confirmations: this.activeBuySignal.confirmations
         });
         this.activeBuySignal = {
           isActive: false,
@@ -1776,6 +1810,13 @@ class SyrupTradingBot {
           confirmations: 0,
           lastConfirmationTime: null
         };
+      } else {
+        // Log that we're keeping the signal active due to high score
+        logger.debug('Maintaining active signal - score remains above threshold', {
+          currentTotalScore: totalScore,
+          minRequired: this.buyConfig.minScore,
+          confirmations: this.activeBuySignal.confirmations
+        });
       }
     }
     
@@ -1785,17 +1826,24 @@ class SyrupTradingBot {
         ...techScore,
         price: currentPrice,
         timestamp: currentTime.toISOString(),
-        score: totalScore, // Use total score instead of just tech score
+        score: totalScore, // Total score out of 21
+        techScore: techScore.score, // Individual component scores for reference
         dipScore: dipScore.score,
-        low24hScore: low24hScore.score
+        low24hScore: low24hScore.score,
+        confirmations: this.activeBuySignal.isActive ? this.activeBuySignal.confirmations : 0
       };
+      
+      // Add to pending signals for 2-candle confirmation
+      this.pendingBuySignals.push(newSignal);
       
       // Log the new signal
       logger.debug('New buy signal detected', {
         timestamp: currentTime.toISOString(),
-        score: techScore.score,
+        totalScore: totalScore,
+        techScore: techScore.score,
         price: currentPrice,
-        hasActiveSignal: this.activeBuySignal.isActive
+        hasActiveSignal: this.activeBuySignal.isActive,
+        currentConfirmations: this.activeBuySignal.confirmations
       });
       
       // If no active signal, this is a new signal
@@ -1806,22 +1854,39 @@ class SyrupTradingBot {
           signalTime: currentTime,
           confirmations: 1,
           lastConfirmationTime: currentTime,
-          orderIds: []
+          orderIds: [],
+          initialScore: totalScore // Store the initial score for reference
         };
         logger.info('New buy signal activated', { 
           price: currentPrice,
-          score: techScore.score 
+          totalScore: totalScore,
+          techScore: techScore.score,
+          dipScore: dipScore.score,
+          low24hScore: low24hScore.score
         });
       } else {
         // Only increment confirmation if this is a new candle (at least 1 minute since last confirmation)
         const minutesSinceLastConfirmation = (currentTime - this.activeBuySignal.lastConfirmationTime) / 60000;
         if (minutesSinceLastConfirmation >= 1) {
-          this.activeBuySignal.confirmations = Math.min(2, this.activeBuySignal.confirmations + 1);
-          this.activeBuySignal.lastConfirmationTime = currentTime;
-          logger.debug('Incremented confirmation count', {
-            confirmations: this.activeBuySignal.confirmations,
-            minutesSinceLastConfirmation: minutesSinceLastConfirmation.toFixed(2)
-          });
+          const newConfirmations = Math.min(2, this.activeBuySignal.confirmations + 1);
+          
+          // Only increment confirmations if the score remains strong
+          if (totalScore >= this.buyConfig.minScore) {
+            this.activeBuySignal.confirmations = newConfirmations;
+            this.activeBuySignal.lastConfirmationTime = currentTime;
+            
+            logger.debug('Incremented confirmation count', {
+              prevConfirmations: this.activeBuySignal.confirmations - 1,
+              newConfirmations: newConfirmations,
+              totalScore: totalScore,
+              minutesSinceLastConfirmation: minutesSinceLastConfirmation.toFixed(2)
+            });
+          } else {
+            logger.debug('Skipping confirmation increment - score below threshold', {
+              totalScore: totalScore,
+              minRequired: this.buyConfig.minScore
+            });
+          }
         }
       }
       
@@ -2163,13 +2228,15 @@ class SyrupTradingBot {
                  `@ ${sellPrice.toFixed(8)} ${this.quoteCurrency} (3.5% above buy price)`);
       
       // Place the limit sell order (GTC - Good Till Cancelled)
+      // For limit sell, we specify the amount of base currency (SYRUP) to sell
       const orderResponse = await coinbaseService.submitOrder(
-        this.tradingPair,
-        'SELL',
-        formattedAmount,
-        'limit',
-        sellPrice,
-        true  // Post-only to ensure maker order
+        this.tradingPair,  // productId
+        'SELL',            // side
+        'base_size',       // sideType - indicates the size is in base currency (SYRUP)
+        formattedAmount,   // size - amount of SYRUP to sell
+        'limit',           // orderType
+        sellPrice,         // price for limit order
+        true               // postOnly - ensure maker order
       );
       
       if (orderResponse?.order_id) {
@@ -2253,11 +2320,14 @@ class SyrupTradingBot {
       // 4. Place the market order using the coinbase service
       let orderResponse;
       try {
+        // For market buy, we need to specify the amount of quote currency (USDC) to spend
+        // The size parameter should be the amount of USDC to spend
         orderResponse = await coinbaseService.submitOrder(
-          this.tradingPair,
-          'BUY',
-          positionSize.toString(),
-          'market'
+          this.tradingPair,  // productId
+          'BUY',             // side
+          'quote_size',      // sideType - indicates the size is in quote currency (USDC)
+          positionSize.toString(),  // size - amount of USDC to spend
+          'market'           // orderType
         );
         
         if (!orderResponse?.order_id) {
