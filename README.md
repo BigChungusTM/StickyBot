@@ -149,6 +149,18 @@ These reference documents are automatically generated from the `coinbase-api` pa
 - Understanding the available methods and their parameters
 - Working with WebSocket connections
 
+## License
+
+This project is licensed under the GNU General Public License v3.0. See the [LICENSE](LICENSE) file for details.
+
+## Donations
+
+If you find this project useful and would like to support its development, please consider making a donation:
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/yourpaypal)
+
+Your support helps keep this project maintained and improved!
+
 ## Trading Strategy
 
 ### Buy Signal Generation (21-point System)
