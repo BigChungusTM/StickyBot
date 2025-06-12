@@ -327,74 +327,115 @@ class CoinbaseService {
    * @param {number} [price] - price for limit order
    * @param {boolean} [postOnly] - whether to use post-only (maker) mode
    */
-  async submitOrder(productId, side, sideType, size, orderType = 'market', price = null, postOnly = false) {
-    // Use the library's method to generate a client_order_id as suggested by its warning
-    const clientOrderId = (this.client && typeof this.client.generateNewOrderId === 'function')
-                          ? this.client.generateNewOrderId()
-                          : require('uuid').v4(); // Fallback if method not found or client not init'd (should not happen here)
-    
-    let orderConfiguration;
-    const sideUpper = side.toUpperCase();
-    const orderTypeLower = orderType.toLowerCase();
-    const sizeStr = size.toString();
-    
-    if (orderTypeLower === 'market') {
-      // For market orders, we need to structure the order configuration differently
-      // based on whether we're specifying base_size or quote_size
-      if (sideType === 'quote_size' || (sideUpper === 'BUY' && sideType !== 'base_size')) {
-        // For market buy with quote_size (spending a specific amount of quote currency)
-        orderConfiguration = {
-          market_market_ioc: {
-            quote_size: sizeStr
-          }
-        };
-      } else if (sideType === 'base_size' || sideUpper === 'SELL') {
-        // For market sell with base_size (selling a specific amount of base currency)
-        orderConfiguration = {
-          market_market_ioc: {
-            base_size: sizeStr
-          }
-        };
-      } else {
-        throw new Error('Invalid sideType for market order. Must be "base_size" or "quote_size".');
-      }
-    } else if (orderTypeLower === 'limit') {
-      if (!price) throw new Error('Limit orders require a price');
-      const priceStr = price.toString();
-      
-      if (sideUpper === 'BUY' || sideUpper === 'SELL') {
-        orderConfiguration = {
-          limit_limit_gtc: {
-            base_size: sizeStr,
-            limit_price: priceStr,
-            post_only: !!postOnly
-          }
-        };
-      } else {
-        throw new Error('Invalid side for limit order. Must be BUY or SELL.');
-      }
-    } else {
-      throw new Error(`Order type "${orderType}" is not supported. Use 'market' or 'limit'.`);
+  async submitOrder(productId, side, size, orderType = 'market', price = null, postOnly = false) {
+    // Input validation
+    if (typeof productId !== 'string' || !productId.includes('-')) {
+      throw new Error('Invalid productId. Must be in format "BASE-QUOTE" (e.g., "SYRUP-USDC")');
     }
 
-    const params = {
-      client_order_id: clientOrderId,
-      product_id: productId,
-      side: sideUpper,
-      order_configuration: orderConfiguration,
-    };
+    const upperSide = side?.toUpperCase();
+    if (upperSide !== 'BUY' && upperSide !== 'SELL') {
+      throw new Error('Invalid side. Must be "BUY" or "SELL"');
+    }
 
-    console.log(`Submitting order with params:`, JSON.stringify(params, null, 2));
+    const numericSize = parseFloat(size);
+    if (isNaN(numericSize) || numericSize <= 0) {
+      throw new Error('Size must be a positive number');
+    }
+
+    const lowerOrderType = orderType?.toLowerCase();
+    if (lowerOrderType !== 'market' && lowerOrderType !== 'limit') {
+      throw new Error('Invalid orderType. Must be "market" or "limit"');
+    }
+
+    if (lowerOrderType === 'limit') {
+      const numericPrice = parseFloat(price);
+      if (isNaN(numericPrice) || numericPrice <= 0) {
+        throw new Error('Price is required and must be a positive number for limit orders');
+      }
+    }
+
+    // Generate client order ID
+    const clientOrderId = (this.client && typeof this.client.generateNewOrderId === 'function')
+      ? this.client.generateNewOrderId()
+      : require('uuid').v4();
+      
     try {
+      // First, verify the product exists and is tradable
+      const products = await this.client.getProducts();
+      const product = products.products.find(p => p.product_id === productId);
+      if (!product) {
+        throw new Error(`Product ${productId} not found. Available products: ${products.products.slice(0, 5).map(p => p.product_id).join(', ')}...`);
+      }
+      if (product.trading_disabled) {
+        throw new Error(`Trading is disabled for ${productId}. Status: ${product.status}`);
+      }
+      console.log(`Product ${productId} is available for trading.`);
+      
+      let orderConfiguration;
+      const orderTypeLower = orderType.toLowerCase();
+      const sideUpper = side.toUpperCase();
+      const sizeStr = size.toString();
+      
+      if (orderTypeLower === 'market') {
+        orderConfiguration = {
+          market_market_ioc: {}
+        };
+        
+        if (sideUpper === 'BUY') {
+          // For market buy, size is the amount of base currency to buy (e.g., SYRUP)
+          orderConfiguration.market_market_ioc.base_size = sizeStr;
+        } else if (sideUpper === 'SELL') {
+          // For market sell, size is the amount of base currency to sell (e.g., SYRUP)
+          orderConfiguration.market_market_ioc.base_size = sizeStr;
+        } else {
+          throw new Error('Invalid side for market order. Must be BUY or SELL.');
+        }
+      } else if (orderTypeLower === 'limit') {
+        if (!price) throw new Error('Limit orders require a price');
+        
+        if (sideUpper === 'BUY' || sideUpper === 'SELL') {
+          orderConfiguration = {
+            limit_limit_gtc: {
+              base_size: sizeStr,
+              price: price.toString(),
+              post_only: !!postOnly
+            }
+          };
+        } else {
+          throw new Error('Invalid side for limit order. Must be BUY or SELL.');
+        }
+      } else {
+        throw new Error(`Order type "${orderType}" is not yet implemented.`);
+      }
+      
+      const params = {
+        client_order_id: clientOrderId,
+        product_id: productId,
+        side: sideUpper,
+        order_configuration: orderConfiguration,
+      };
+      
+      console.log('Submitting order with params:', JSON.stringify(params, null, 2));
+      
+      // Submit the order
       const response = await this.client.submitOrder(params);
       console.log('Order submission successful:', JSON.stringify(response, null, 2));
       return response;
     } catch (error) {
-      console.error(`Error submitting order for ${productId}:`, error.message || error);
-      if (error.response && error.response.data) {
-        console.error('Error details:', error.response.data);
+      const errorMessage = `Error submitting ${orderType} ${side} order for ${productId}: ${error.message || error}`;
+      console.error(errorMessage);
+      
+      // Log additional error details if available
+      if (error.response) {
+        console.error('Error response status:', error.response.status);
+        if (error.response.data) {
+          console.error('Error response data:', JSON.stringify(error.response.data, null, 2));
+        }
       }
-      throw error;
+      
+      // Re-throw with a more descriptive error message
+      throw new Error(errorMessage);
     }
   }
 }

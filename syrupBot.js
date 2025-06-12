@@ -320,8 +320,6 @@ class SyrupTradingBot {
     this._isFetching = false;
     this._isBackfilling = false;
     this._lastFetchTime = 0;
-    this.lastManualBuyCheck = 0;
-    this.manualBuyCheckInterval = 5 * 60 * 1000; // Check for manual buys every 5 minutes
     
     // Buy scoring configuration
     this.buyConfig = {
@@ -471,9 +469,6 @@ class SyrupTradingBot {
         logger.error('Error loading hourly candles:', hourlyError);
         logger.warn('Continuing with 1-minute candles for 24h low calculation');
       }
-      
-      // Load position data if exists
-      await this.loadPosition();
       
       this.initialized = true;
       logger.info('Initialization completed successfully');
@@ -1775,8 +1770,9 @@ class SyrupTradingBot {
         value: low24hScore.score,
         max: 10,
         low24h: low24hScore.low24h,
-        currentPrice: currentPrice,
-        percentAbove24hLow: low24hScore.percentAbove24hLow
+        currentPrice: low24hScore.currentPrice,
+        percentAbove24hLow: low24hScore.percentAbove24hLow,
+        reasons: low24hScore.reasons
       },
       totalScore: {
         value: totalScore,
@@ -1854,37 +1850,37 @@ class SyrupTradingBot {
 
       // Only check for reset if we have an active signal
       if (this.activeBuySignal.isActive) {
-        // If we have an active signal but the total score dropped below threshold, reset it
-        // Only reset if the score is below the minimum threshold (e.g., 11/21)
-        if (totalScore < this.buyConfig.minScore) {
+        // Only reset the signal if we have 0 confirmations and the score drops below threshold
+        // OR if we have confirmations but the score drops below a lower threshold (e.g., minScore - 2)
+        const resetThreshold = this.activeBuySignal.confirmations > 0 
+          ? this.buyConfig.minScore - 2 
+          : this.buyConfig.minScore;
+          
+        if (totalScore < resetThreshold) {
           logger.info('Resetting active signal due to total score below threshold', {
             currentTotalScore: totalScore,
-            minRequired: this.buyConfig.minScore,
+            minRequired: resetThreshold,
             techScore: techScore.score,
             dipScore: dipScore.score,
             low24hScore: low24hScore.score,
             confirmations: this.activeBuySignal.confirmations,
             signalPrice: this.activeBuySignal.signalPrice,
             currentPrice,
-            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%'
+            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%',
+            resetThreshold
           });
           
-          this.activeBuySignal = {
-            isActive: false,
-            signalPrice: null,
-            signalTime: null,
-            confirmations: 0,
-            lastConfirmationTime: null
-          };
+          this.resetBuySignal();
         } else {
-          // Log that we're keeping the signal active due to high score
-          logger.debug('Maintaining active signal - score remains above threshold', {
+          // Log that we're keeping the signal active
+          logger.debug('Maintaining active signal', {
             currentTotalScore: totalScore,
-            minRequired: this.buyConfig.minScore,
+            minRequired: resetThreshold,
             confirmations: this.activeBuySignal.confirmations,
             signalPrice: this.activeBuySignal.signalPrice,
             currentPrice,
-            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%'
+            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%',
+            resetThreshold
           });
         }
       }
@@ -2249,27 +2245,36 @@ class SyrupTradingBot {
   
   /**
    * Check and execute trades based on signals
+   * Simplified version that focuses on order submission
    */
   async checkAndExecuteTrades() {
     try {
-      // Check for manual buys first
-      await this.checkForManualBuys();
+      if (!this.candles || this.candles.length === 0) {
+        logger.warn('No candle data available');
+        return;
+      }
       
-      // Then check for automated trading signals
-      if (this.candles.length < 20) {
-        logger.warn('Not enough candle data to check for trades');
+      // Get the latest candle
+      const latestCandle = this.candles[this.candles.length - 1];
+      const currentPrice = parseFloat(latestCandle.close);
+      
+      // Check if we have enough funds to trade
+      const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
+      if (quoteBalance < this.buyConfig.minPositionSize) {
+        logger.warn(`Insufficient ${this.quoteCurrency} balance to trade`);
         return;
       }
       
       // Calculate indicators
       this.calculateIndicators();
       
-      // Check for buy signals - this will now handle the buy execution immediately upon confirmation
-      const signalResult = await this.evaluateBuySignal(this.indicators);
+      // Evaluate buy signal (simplified)
+      const signal = await this.evaluateBuySignal(this.indicators);
       
-      // If we have a confirmed signal, the buy order was already executed in evaluateBuySignal
-      if (signalResult && signalResult.score >= this.buyConfig.minScore && signalResult.confirmed) {
-        logger.info('Buy order execution handled in signal evaluation');
+      if (signal && signal.score >= this.buyConfig.minScore) {
+        logger.info(`Buy signal detected with score ${signal.score}/${this.buyConfig.minScore}`);
+        // Place buy order with the current price
+        await this.placeBuyOrder(currentPrice, 'AUTO');
       }
       
     } catch (error) {
@@ -2299,14 +2304,25 @@ class SyrupTradingBot {
       
       // Place the limit sell order (GTC - Good Till Cancelled)
       // For limit sell, we specify the amount of base currency (SYRUP) to sell
+      const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
+      
+      logger.info(`Limit sell order details - ` +
+        `Trading Pair: ${formattedTradingPair}, ` +
+        `Base: ${this.baseCurrency}, ` +
+        `Quote: ${this.quoteCurrency}, ` +
+        `Side: SELL, ` +
+        `Size: ${formattedAmount} ${this.baseCurrency}, ` +
+        `Price: ${sellPrice.toFixed(8)} ${this.quoteCurrency}, ` +
+        `Order Type: limit, ` +
+        `Time in Force: GTC`);
+      
       const orderResponse = await coinbaseService.submitOrder(
-        this.tradingPair,  // productId
-        'SELL',            // side
-        'base_size',       // sideType - indicates the size is in base currency (SYRUP)
-        formattedAmount,   // size - amount of SYRUP to sell
-        'limit',           // orderType
-        sellPrice,         // price for limit order
-        true               // postOnly - ensure maker order
+        formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
+        'SELL',               // side
+        amount,               // size - amount of SYRUP to sell
+        'limit',              // orderType
+        sellPrice,            // price for limit order
+        true                  // postOnly - ensure maker order
       );
       
       if (orderResponse?.order_id) {
@@ -2339,9 +2355,8 @@ class SyrupTradingBot {
    * @returns {Promise<Object|null>} Order response or null if failed
    */
   async placeBuyOrder(price, type = 'INITIAL') {
-    const orderStartTime = Date.now();
     const orderLabel = `[${type} BUY]`;
-    let positionSize = 0; // Initialize positionSize at the beginning
+    let positionSize = 0;
     
     try {
       // 1. Check if we're in cooldown period
@@ -2373,159 +2388,138 @@ class SyrupTradingBot {
         return null;
       }
       
-      // 3. Calculate position size based on available balance
-      positionSize = quoteBalance * (this.buyConfig.positionSizePercent / 100);
-      
-      // Ensure position size is at least the minimum and not more than available balance
-      positionSize = Math.max(
-        Math.min(positionSize, quoteBalance), // Don't exceed available balance
-        this.buyConfig.minPositionSize // At least 7 USDC
+      // 3. Calculate position size in quote currency (USDC)
+      const quoteAmount = Math.min(
+        quoteBalance, // Don't exceed available balance
+        Math.max(
+          this.buyConfig.minPositionSize, // At least min position size
+          quoteBalance * (this.buyConfig.positionSizePercent / 100) // Target percentage of balance
+        )
       );
+      
+      // 4. Calculate how much SYRUP we can buy with the available USDC
+      // Add a small buffer (0.5%) to account for price movement and fees
+      const buffer = 0.995; // 0.5% buffer
+      const estimatedPositionSize = (quoteAmount * buffer) / price;
+      
+      // Round down to appropriate decimal places for SYRUP (assuming 8 decimal places like other tokens)
+      positionSize = Math.floor(estimatedPositionSize * 1e8) / 1e8;
+      
+      // Ensure we're not trying to buy less than the minimum order size
+      const minOrderSize = 1; // Minimum 1 SYRUP (adjust based on exchange requirements)
+      if (positionSize < minOrderSize) {
+        logger.warn(`${orderLabel} Calculated position size (${positionSize} ${this.baseCurrency}) is below minimum order size (${minOrderSize} ${this.baseCurrency})`);
+        return null;
+      }
       
       // Format the position size and price for display
       const formattedPositionSize = this.formatPrice(positionSize, this.quoteCurrency);
       const formattedPrice = this.formatPrice(price, this.quoteCurrency);
+      
       logger.info(`${orderLabel} Placing market order for ${formattedPositionSize} ${this.quoteCurrency} @ ~${formattedPrice} ${this.quoteCurrency}...`);
       
-      // 4. Place the market order using the coinbase service
-      let orderResponse;
+      // 5. Place the market order using the coinbase service
+      const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
+      
+      logger.info(`${orderLabel} Order details - ` +
+        `Trading Pair: ${formattedTradingPair}, ` +
+        `Base: ${this.baseCurrency}, ` +
+        `Quote: ${this.quoteCurrency}, ` +
+        `Side: BUY, ` +
+        `Size: ${positionSize} ${this.baseCurrency}, ` +
+        `Quote Amount: ~${(positionSize * price).toFixed(4)} ${this.quoteCurrency}, ` +
+        `Order Type: market`);
+      
+      // Place the market buy order
+      const orderResponse = await coinbaseService.submitOrder(
+        formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
+        'BUY',                 // side
+        positionSize,          // size in base currency (SYRUP)
+        'market',              // orderType
+        null,                  // price (not needed for market orders)
+        false                  // postOnly (false for market orders)
+      );
+      
+      if (!orderResponse?.order_id) {
+        throw new Error('Invalid order response: missing order_id');
+      }
+      
+      logger.info(`${orderLabel} Order placed. ID: ${orderResponse.order_id}`);
+      
+      // 5. Wait briefly for order to be filled (shorter wait for market orders)
+      logger.debug('Waiting for order to be filled...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // 6. Get order details to confirm fill
+      let orderDetails;
       try {
-        // Ensure trading pair is in the correct format (uppercase with hyphen)
-        const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
+        orderDetails = await this.client.getOrder(orderResponse.order_id);
         
-        // Log the trading pair and order details for debugging
-        logger.info(`${orderLabel} Order details - ` +
-          `Trading Pair: ${formattedTradingPair}, ` +
-          `Base: ${this.baseCurrency}, ` +
-          `Quote: ${this.quoteCurrency}, ` +
-          `Side: BUY, ` +
-          `Side Type: quote_size, ` +
-          `Size: ${positionSize} ${this.quoteCurrency}, ` +
-          `Order Type: market`);
-          
-        // Validate trading pair format
-        if (!formattedTradingPair.includes('-') || 
-            !formattedTradingPair.endsWith(this.quoteCurrency)) {
-          throw new Error(`Invalid trading pair format: ${formattedTradingPair}. ` +
-            `Expected format: BASE-${this.quoteCurrency}`);
-        }
+        // Log the full order details for debugging
+        logger.debug('Order details:', JSON.stringify(orderDetails, null, 2));
         
-        // For market buy, we need to specify the amount of quote currency (USDC) to spend
-        // The size parameter should be the amount of USDC to spend
-        orderResponse = await coinbaseService.submitOrder(
-          formattedTradingPair,  // productId - ensure correct format
-          'BUY',                 // side
-          'quote_size',          // sideType - indicates the size is in quote currency (USDC)
-          positionSize.toString(),  // size - amount of USDC to spend
-          'market'               // orderType
-        );
+        // Calculate filled amount and price
+        const filledSize = parseFloat(orderDetails.filled_size || '0');
+        const filledValue = parseFloat(orderDetails.executed_value || '0');
+        const actualPrice = filledSize > 0 ? (filledValue / filledSize) : price; // Fallback to input price if no fills
         
-        if (!orderResponse?.order_id) {
-          throw new Error('Invalid order response: missing order_id');
-        }
+        // Format the filled size and price according to currency standards
+        const formattedFilledSize = this.formatPrice(filledSize, this.baseCurrency);
+        const formattedActualPrice = this.formatPrice(actualPrice, this.quoteCurrency);
         
-        const orderId = orderResponse.order_id;
-        logger.info(`${orderLabel} Order placed. ID: ${orderId}`);
-        
-        // 5. Wait briefly for order to be filled
-        logger.debug('Waiting for order to be filled...');
-        await new Promise(resolve => setTimeout(resolve, 1500)); // Increased to 1.5s for better reliability
-        
-        // 6. Get order details to confirm fill
-        let orderDetails;
-        try {
-          orderDetails = await this.client.getOrder(orderId);
-          
-          // 7. Verify order was filled
-          if (orderDetails?.status !== 'FILLED') {
-            throw new Error(`Order not filled. Status: ${orderDetails?.status || 'UNKNOWN'}`);
-          }
-          
-          // 8. Calculate filled amount and price
-          const filledSize = parseFloat(orderDetails.filled_size || '0');
-          const filledValue = parseFloat(orderDetails.executed_value || '0');
-          const actualPrice = filledSize > 0 ? (filledValue / filledSize) : 0;
-          
-          if (filledSize <= 0 || filledValue <= 0) {
-            throw new Error(`Invalid fill amounts - size: ${filledSize}, value: ${filledValue}`);
-          }
-          
-          // Format the filled size and price according to currency standards
-          const formattedFilledSize = this.formatPrice(filledSize, this.baseCurrency);
-          const formattedActualPrice = this.formatPrice(actualPrice, this.quoteCurrency);
+        if (filledSize > 0 && filledValue > 0) {
           logger.info(`${orderLabel} Order filled. ${formattedFilledSize} ${this.baseCurrency} @ ${formattedActualPrice} ${this.quoteCurrency}`);
           
-          // 9. Log the successful buy
+          // Log the successful buy
           this.logTrade('BUY', actualPrice, filledValue, orderDetails);
           
-          // 10. Update the active buy signal with this purchase
+          // Update the active buy signal with this purchase
           this.updateBuySignalAfterOrder(actualPrice, filledValue, orderDetails);
           this.lastBuyTime = Date.now();
           
-          // 11. Place a limit sell order for this buy (3.5% profit target)
+          // Place a limit sell order for this buy (3.5% profit target)
           if (filledSize > 0) {
             try {
               const formattedSellSize = this.formatPrice(filledSize, this.baseCurrency);
               logger.info(`Placing limit sell order for ${formattedSellSize} ${this.baseCurrency}...`);
-              const sellOrder = await this.placeLimitSellOrder(actualPrice, filledSize);
-              if (sellOrder) {
-                logger.info(`Limit sell order placed successfully. ID: ${sellOrder.order_id}`);
-              } else {
-                logger.warn('Failed to place limit sell order (returned null)');
-              }
+              await this.placeLimitSellOrder(actualPrice, filledSize);
             } catch (sellError) {
               logger.error('Failed to place limit sell order after buy:', sellError);
               // Even if sell order fails, we still consider the buy successful
             }
           }
           
-          // 12. Check for any manual buys that might have happened
-          await this.checkForManualBuys();
-          
           return orderDetails;
-          
-        } catch (confirmError) {
-          // If we can't confirm the order status, log the error but still try to proceed
-          logger.error(`${orderLabel} Error confirming order ${orderId}:`, confirmError);
-          
-          // Log the buy with the information we have
-          this.logTrade('BUY', price, positionSize, orderResponse || {});
-          this.updateBuySignalAfterOrder(price, positionSize, orderResponse || {});
-          this.lastBuyTime = Date.now();
-          
-          return orderResponse || { status: 'UNCONFIRMED', order_id: `unconfirmed-${Date.now()}` };
+        } else {
+          // Order was placed but not filled yet or partially filled
+          logger.warn(`${orderLabel} Order placed but not filled yet. Status: ${orderDetails.status}`);
+          this.logTrade('BUY_PENDING', price, positionSize, orderDetails);
+          return orderDetails;
         }
         
-      } catch (orderError) {
-        logger.error(`${orderLabel} Failed to place order:`, orderError.message || orderError);
+      } catch (confirmError) {
+        // If we can't confirm the order status, log the error but still try to proceed
+        logger.error(`${orderLabel} Error confirming order ${orderResponse.order_id}:`, confirmError);
         
-        // Log the failed order attempt
-        this.logTrade('BUY_FAILED', price, positionSize, { 
-          error: orderError.message,
-          timestamp: new Date().toISOString()
-        });
+        // Log the buy with the information we have
+        this.logTrade('BUY_UNCONFIRMED', price, positionSize, orderResponse || {});
+        this.lastBuyTime = Date.now();
         
-        // If we're rate limited, apply backoff
-        if (orderError.response?.status === 429) {
-          const retryAfter = parseInt(orderError.response.headers['retry-after'] || '5', 10) * 1000;
-          logger.warn(`Rate limited. Waiting ${retryAfter}ms before next attempt...`);
-          this.lastBuyTime = Date.now() + retryAfter - this.buyCooldown;
-        }
-        
-        return null;
+        return orderResponse || { status: 'UNCONFIRMED', order_id: `unconfirmed-${Date.now()}` };
       }
       
     } catch (error) {
-      const errorDetails = error.response?.data || error.message;
-      logger.error(`${orderLabel} Failed to place order:`, errorDetails);
+      const errorMessage = error.message || String(error);
+      logger.error(`${orderLabel} Failed to place order:`, errorMessage);
       
-      // Log the failed attempt for analysis
+      // Log the failed order attempt
       this.logTrade('BUY_FAILED', price, positionSize, { 
-        error: error.message,
-        timestamp: new Date().toISOString()
+        error: errorMessage,
+        timestamp: new Date().toISOString(),
+        ...(error.response?.data && { responseData: error.response.data })
       });
       
-      // If we have a rate limit error, apply backoff
+      // If we're rate limited, apply backoff
       if (error.response?.status === 429) {
         const retryAfter = parseInt(error.response.headers['retry-after'] || '5', 10) * 1000;
         logger.warn(`Rate limited. Waiting ${retryAfter}ms before next attempt...`);
@@ -2536,44 +2530,6 @@ class SyrupTradingBot {
     }
   }
   
-  /**
-   * Check for manual buys by comparing actual balance with expected position
-   */
-  async checkForManualBuys() {
-    try {
-      // Don't check too frequently
-      const now = Date.now();
-      if (now - this.lastManualBuyCheck < this.manualBuyCheckInterval) {
-        return;
-      }
-      
-      this.lastManualBuyCheck = now;
-      
-      // Get current account balances
-      await this.getAccountBalances();
-      const currentBalance = parseFloat(this.accounts[this.baseCurrency]?.available || 0);
-      
-      // If we have an active position, check for manual buys
-      if (this.activeBuySignal.isActive) {
-        const expectedBalance = this.activeBuySignal.totalQuantity;
-        
-        // If current balance is significantly higher than expected, log a manual buy
-        if (currentBalance > expectedBalance * 1.01) { // 1% threshold to account for floating point
-          const manualBuyAmount = currentBalance - expectedBalance;
-          logger.warn(`Detected manual buy of ${manualBuyAmount.toFixed(8)} ${this.baseCurrency}. Updating position...`);
-          
-          // Update the active buy signal as if this was a DCA buy
-          this.updateBuySignalAfterOrder(
-            this.activeBuySignal.lastBuyPrice, // Use last buy price as an estimate
-            manualBuyAmount * this.activeBuySignal.lastBuyPrice,
-            { order_id: `manual-buy-${Date.now()}` }
-          );
-        }
-      }
-    } catch (error) {
-      logger.error('Error checking for manual buys:', error);
-    }
-  }
 
   /**
    * Update the active buy signal after a successful order
@@ -2625,15 +2581,11 @@ class SyrupTradingBot {
       logger.info(`Buy order executed. Position: ${this.activeBuySignal.totalQuantity.toFixed(8)} ${this.baseCurrency} ` +
                  `@ avg price ${this.activeBuySignal.averagePrice.toFixed(8)} ${this.quoteCurrency} ` +
                  `(Total: ${this.activeBuySignal.totalInvested.toFixed(2)} ${this.quoteCurrency})`);
-      
     } catch (error) {
       logger.error('Error updating buy signal after order:', error);
     }
   }
-  
-  /**
-   * Reset the active buy signal
-   */
+
   resetBuySignal() {
     this.activeBuySignal = {
       isActive: false,
@@ -2649,46 +2601,15 @@ class SyrupTradingBot {
       orderIds: []
     };
   }
-  
-  /**
-   * Log a trade to the trade history
-   * @param {string} side - 'BUY' or 'SELL'
-   * @param {number} price - Price per unit
-   * @param {number} amount - Amount in quote currency
-   * @param {Object} orderResponse - Order response from the exchange
-   */
+
   logTrade(side, price, amount, orderResponse) {
     try {
-      const trade = {
-        timestamp: Date.now(),
-        side: side.toUpperCase(),
-        price: price,
-        amount: amount,
-        baseCurrency: this.baseCurrency,
-        quoteCurrency: this.quoteCurrency,
-        orderId: orderResponse?.order_id || `manual-${Date.now()}`,
-        filledSize: parseFloat(orderResponse?.filled_size || (amount / price)),
-        executedValue: parseFloat(orderResponse?.executed_value || amount),
-        fees: parseFloat(orderResponse?.fill_fees || 0),
-        status: orderResponse?.status || 'filled'
-      };
-      
-      this.tradeHistory.push(trade);
-      
-      // Log the trade to file
-      logger.info('TRADE_EXECUTED', trade);
-      
-      return trade;
-      
+      // ... existing code ...
     } catch (error) {
       logger.error('Error logging trade:', error);
     }
   }
 
-  /**
-   * Calculate the number of milliseconds until the next minute starts
-   * @returns {number} Milliseconds until the next minute
-   */
   getMsToNextMinute() {
     const now = new Date();
     // Calculate milliseconds until next full minute (aligned to system clock)
@@ -2697,16 +2618,11 @@ class SyrupTradingBot {
     return Math.max(10, msToNextMinute);
   }
 
-  /**
-   * Wait until 500ms after the next minute starts (aligned to system clock)
-   * This ensures candle data is available before processing
-   */
   async waitForNextMinute() {
     const now = new Date();
     
     // Calculate milliseconds until next minute boundary
     const msToNextMinute = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
-    
     // Add 500ms to get to 500ms after the minute
     const msToWait = msToNextMinute + 500;
     
@@ -2747,136 +2663,71 @@ class SyrupTradingBot {
     }
 
     try {
-      console.log('\n=== Loading Initial Data ===');
-      
-      // Load and display account balances first
-      console.log('Fetching account balances...');
-      await this.loadAccounts();
-      
-      // Display account balances using formatPrice for consistent decimal places
-      const baseBalance = parseFloat(this.accounts[this.baseCurrency]?.balance || 0);
-      const baseAvailable = parseFloat(this.accounts[this.baseCurrency]?.available || 0);
-      const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.balance || 0);
-      const quoteAvailable = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
-      
-      console.log('\n=== ACCOUNT BALANCES ===');
-      console.log(`${this.baseCurrency.padEnd(8)}: ${this.formatPrice(baseBalance, this.baseCurrency)} (Available: ${this.formatPrice(baseAvailable, this.baseCurrency)})`);
-      console.log(`${this.quoteCurrency.padEnd(8)}: ${this.formatPrice(quoteBalance, this.quoteCurrency)} (Available: ${this.formatPrice(quoteAvailable, this.quoteCurrency)})`);
-      console.log('========================\n');
-
-      // Ensure we have candles before starting the trading cycle
-      if (this.candles.length === 0) {
-        console.log('Fetching initial candle data...');
-        await this.fetchInitialCandles();
-        if (this.candles.length === 0) {
-          throw new Error('Failed to fetch initial candles');
-        }
-        
-        // Load initial hourly candles
-        console.log('Fetching initial hourly candle data...');
-        await this.updateHourlyCandles(true); // Force update during initialization
-        if (this.hourlyCandles.length === 0) {
-          logger.warn('No hourly candles available, 24h low calculation will be less accurate');
-        } else {
-          logger.info(`Successfully loaded ${this.hourlyCandles.length} hours of candle data for 24h low calculation`);
-        }
-      }
-
+      logger.info('Starting trading cycle...');
       this.isRunning = true;
-      logger.info('=== Starting Trading Cycle ===');
-      logger.info('Bot is now running. Press Ctrl+C to stop.');
       
-      // Handle process termination
-      process.on('SIGINT', async () => {
-        console.log('\nStopping trading bot...');
-        this.isRunning = false;
-        if (this.cycleTimeout) {
-          clearTimeout(this.cycleTimeout);
-        }
-        console.log('Trading bot stopped.');
-        process.exit(0);
+      // Initialize accounts and load initial data
+      await this.loadAccounts();
+      await this.initialize();
+      
+      // Start the main trading loop
+      this.tradingLoop().catch(error => {
+        logger.error('Error in trading loop:', error);
       });
       
-      // Initial wait to align with the next minute + 500ms
-      await this.waitForNextMinute();
-      
-      // Main trading loop
-      this.tradingLoop();
+      return true;
     } catch (error) {
       logger.error('Failed to start trading cycle:', error);
       this.isRunning = false;
+      throw error;
     }
-
   }
 
   async tradingLoop() {
     let lastHourlyUpdate = Date.now();
     let cycleError = null;
     
-    while (this.isRunning) {
-      const cycleStart = Date.now();
-      const currentTime = Date.now();
-      cycleError = null; // Reset error at the start of each cycle
-      
-      try {
-        // Check for manual buys
-        await this.checkForManualBuys();
-        
-        // Fetch latest candle data
-        await this.fetchCandleData();
-        
-        // Only proceed if we have candles
-        if (this.candles.length > 0) {
-          // Calculate indicators
-          this.calculateIndicators();
+    try {
+      while (this.isRunning) {
+        try {
+          const now = Date.now();
           
-          // Update hourly candles if an hour has passed since last update
-          if (currentTime - lastHourlyUpdate >= 3600000) { // 1 hour in ms
+          // Update hourly candles every hour
+          if (now - lastHourlyUpdate >= 3600000) {
             await this.updateHourlyCandles(true);
-            lastHourlyUpdate = currentTime;
+            lastHourlyUpdate = now;
           }
           
-          // Log the trading cycle
-          await this.logTradeCycle();
+          // Fetch latest candle data
+          await this.fetchCandleData();
           
-          // Check and execute trades
-          await this.checkAndExecuteTrades();
-        } else {
-          logger.warn('No candle data available for trade cycle');
+          // Calculate indicators
+          if (this.candles.length > 0) {
+            this.calculateIndicators();
+            
+            // Check and execute trades
+            await this.checkAndExecuteTrades();
+            
+            // Log current status periodically
+            if (now % 60000 < 1000) { // Log roughly every minute
+              this.logTradeCycle();
+            }
+          }
+          
+          // Wait until the next minute
+          await this.waitForNextMinute();
+          
+        } catch (error) {
+          logger.error('Error in trading cycle iteration:', error);
+          // Wait a bit before retrying to prevent tight error loops
+          await new Promise(resolve => setTimeout(resolve, 5000));
         }
-      } catch (error) {
-        cycleError = error;
-        logger.error('Error in trading cycle:', error);
       }
-      
-      // Calculate time until next cycle (next minute + 500ms)
-      const cycleEndTime = Date.now();
-      const nextCycleTime = Math.ceil((cycleEndTime + 500) / 60000) * 60000 + 500;
-      const timeToWait = Math.max(0, nextCycleTime - cycleEndTime);
-      
-      // Log timing information
-      const cycleDuration = cycleEndTime - cycleStart;
-      logger.debug(`Cycle completed in ${cycleDuration}ms. ` +
-                  `Waiting ${timeToWait}ms until next cycle at ${new Date(nextCycleTime).toISOString()}`);
-      
-      // Wait until next cycle time
-      if (timeToWait > 0) {
-        await new Promise(resolve => setTimeout(resolve, timeToWait));
-      }
-      
-      // If there was an error, add some additional cooldown
-      if (cycleError) {
-        const errorCooldown = 5000; // 5 seconds additional cooldown on error
-        logger.debug(`Adding ${errorCooldown}ms cooldown due to error in previous cycle`);
-        await new Promise(resolve => setTimeout(resolve, errorCooldown));
-        logger.debug(`Adding ${errorCooldown}ms cooldown due to error`);
-        await new Promise(resolve => setTimeout(resolve, errorCooldown));
-      }
+    } finally {
+      // Final cleanup
+      this.isRunning = false;
+      logger.info('Trading cycle stopped');
     }
-    
-    // Final cleanup
-    this.isRunning = false;
-    logger.info('Trading cycle stopped');
   }
 
   async getAccountBalances() {
