@@ -3,13 +3,30 @@
 
 # Environment variables
 .env
+.env.*.local
+!.env.example
 
-# Logs
-logs
+# Logs and cache
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Bot generated data
+candle_*.json
+candle_cache.json
+position_*.json
+trade_*.json
+*.cache
+.cache/
+
+# Cache files
+.cache/
+.parcel-cache/
+.temp/
+.tmp/
+.temp*/
 
 # Runtime data
 pids
