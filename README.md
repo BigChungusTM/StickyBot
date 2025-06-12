@@ -18,6 +18,49 @@ SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRU
 - Detailed logging and trade history
 - Precise system clock-aligned trading cycles (minute + 500ms)
 
+## Installation
+
+### Prerequisites
+- Node.js (v14 or later)
+- npm (comes with Node.js)
+- Coinbase Advanced Trade API credentials
+
+### Windows
+1. Clone the repository:
+   ```
+   git clone https://github.com/yourusername/StickyBot.git
+   cd StickyBot
+   ```
+2. Run the installer:
+   ```
+   install.bat
+   ```
+3. Edit the `.env` file with your configuration
+4. Start the bot:
+   ```
+   start.bat
+   ```
+
+### Linux/macOS
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/StickyBot.git
+   cd StickyBot
+   ```
+2. Make the scripts executable:
+   ```bash
+   chmod +x install.sh start.sh
+   ```
+3. Run the installer:
+   ```bash
+   ./install.sh
+   ```
+4. Edit the `.env` file with your configuration
+5. Start the bot:
+   ```bash
+   ./start.sh
+   ```
+
 ## Core Components
 
 ### 1. Candle Management
