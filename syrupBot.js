@@ -7,6 +7,7 @@ import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import axios from 'axios';
 import { coinbaseService } from './coinbase.service.js';
+import { telegramService } from './telegram.service.js';
 import { 
   SMA, EMA, RSI, Stochastic, BollingerBands, MACD 
 } from 'technicalindicators';
@@ -321,6 +322,13 @@ class SyrupTradingBot {
     this.processedConfirmations = new Set(); // Track processed confirmations
     this.client = client;
     this.coinbaseService = coinbaseService; // Initialize coinbaseService
+    this.telegramService = telegramService; // Initialize telegramService
+    
+    // Initialize Telegram command handlers if Telegram is enabled
+    if (this.telegramService.enabled) {
+      this.setupTelegramCommands();
+    }
+    
     this.tradingPair = this.config.tradingPair;
     this.baseCurrency = this.config.baseCurrency;
     this.quoteCurrency = this.config.quoteCurrency;
@@ -1017,7 +1025,7 @@ class SyrupTradingBot {
         // If we hit a rate limit, wait and retry with a smaller window
         if (error.message?.includes('rate limit') || error.status === 429) {
           const retryAfter = parseInt(error.headers?.['retry-after'] || '5', 10) * 1000;
-          logger.warn(`Rate limited, waiting ${retryAfter}ms before retrying with smaller window...`);
+          logger.warn(`Rate limited. Will retry after ${retryAfter}ms before retrying with smaller window...`);
           await new Promise(resolve => setTimeout(resolve, retryAfter));
           
           // Try again with half the window size
@@ -2175,63 +2183,51 @@ class SyrupTradingBot {
         
         // Reset the active signal
         this.activeBuySignal = {
-          isActive: false,
-          signalPrice: null,
-          signalTime: null,
-          confirmations: 0,
-          lastConfirmationTime: null
+          isActive: false,          // Whether there's an active buy signal
+          signalPrice: null,        // Price when signal was first triggered
+          signalTime: null,         // Timestamp when signal was first triggered
+          confirmations: 0,         // Number of confirmations received
+          lastConfirmationTime: null, // Timestamp of last confirmation
+          totalInvested: 0,         // Total amount of quote currency invested
+          totalQuantity: 0,         // Total quantity of base currency bought
+          averagePrice: 0,          // Weighted average price of all buys
+          buyCount: 0,              // Number of buy orders placed for this signal
+          lastBuyPrice: 0,          // Price of the last buy order
+          orderIds: []              // Array of order IDs for this signal
         };
-        
-        return cancelledSignal;
-      }
-      
-      // Log the current score components for debugging
-      logger.debug('Signal score evaluation:', {
-        totalScore,
-        techScore: techScore.score,
-        dipScore: dipScore.score,
-        low24hScore: low24hScore.score,
-        minRequired: this.buyConfig.minScore,
-        confirmations: this.activeBuySignal.confirmations,
-        isActive: this.activeBuySignal.isActive,
-        signalPrice: this.activeBuySignal.signalPrice,
-        currentPrice
-      });
-
-      // Only check for reset if we have an active signal
-      if (this.activeBuySignal.isActive) {
-        // Only reset the signal if we have 0 confirmations and the score drops below threshold
-        // OR if we have confirmations but the score drops below a lower threshold (e.g., minScore - 2)
-        const resetThreshold = this.activeBuySignal.confirmations > 0 
-          ? this.buyConfig.minScore - 2 
-          : this.buyConfig.minScore;
+        logger.info('New buy signal activated', { 
+          price: currentPrice,
+          totalScore: totalScore,
+          techScore: techScore.score,
+          dipScore: dipScore.score,
+          low24hScore: low24hScore.score,
+          signalId: this.activeBuySignal.signalId
+        });
+      } else {
+        // Only increment confirmation if this is a new candle (at least 1 minute since last confirmation)
+        const minutesSinceLastConfirmation = (currentTime - this.activeBuySignal.lastConfirmationTime) / 60000;
+        if (minutesSinceLastConfirmation >= 1) {
+          const newConfirmations = Math.min(2, this.activeBuySignal.confirmations + 1);
           
-        if (totalScore < resetThreshold) {
-          logger.info('Resetting active signal due to total score below threshold', {
-            currentTotalScore: totalScore,
-            minRequired: resetThreshold,
-            techScore: techScore.score,
-            dipScore: dipScore.score,
-            low24hScore: low24hScore.score,
-            confirmations: this.activeBuySignal.confirmations,
-            signalPrice: this.activeBuySignal.signalPrice,
-            currentPrice,
-            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%',
-            resetThreshold
-          });
-          
-          this.resetBuySignal();
-        } else {
-          // Log that we're keeping the signal active
-          logger.debug('Maintaining active signal', {
-            currentTotalScore: totalScore,
-            minRequired: resetThreshold,
-            confirmations: this.activeBuySignal.confirmations,
-            signalPrice: this.activeBuySignal.signalPrice,
-            currentPrice,
-            priceDiffPercent: ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2) + '%',
-            resetThreshold
-          });
+          // Only increment confirmations if the score remains strong
+          if (totalScore >= this.buyConfig.minScore) {
+            this.activeBuySignal.confirmations = newConfirmations;
+            this.activeBuySignal.lastConfirmationTime = currentTime;
+            
+            logger.debug('Incremented confirmation count', {
+              prevConfirmations: this.activeBuySignal.confirmations - 1,
+              newConfirmations: newConfirmations,
+              totalScore: totalScore,
+              minutesSinceLastConfirmation: minutesSinceLastConfirmation.toFixed(2),
+              signalId: this.activeBuySignal.signalId
+            });
+          } else {
+            logger.debug('Skipping confirmation increment - score below threshold', {
+              totalScore: totalScore,
+              minRequired: this.buyConfig.minScore,
+              signalId: this.activeBuySignal.signalId
+            });
+          }
         }
       }
     }
@@ -2435,7 +2431,7 @@ class SyrupTradingBot {
       `=== Buy Signal ===`,
       `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${low24hScore.score}/10 (24h Low) = ${totalScore}/21`,
       `⚪ Status: ${isConfirmed ? '✅ Confirmed' : this.activeBuySignal.isActive ? '⏳ Pending' : 'No Signal'}`,
-      `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || 'N/A'}% above)`,
+      `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
       '---',
       ...techScore.reasons.filter(r => !r.includes('Score:')),
       ...dipScore.reasons.filter(r => !r.includes('Score:')),
@@ -2466,11 +2462,167 @@ class SyrupTradingBot {
   }
 
   /**
-   * Format price or amount with appropriate decimal precision
-   * @param {number|string} price - The value to format
-   * @param {string} currency - The currency code (e.g., 'USDC', 'SYRUP', 'USD')
-   * @returns {string} Formatted string with appropriate decimal places
+   * Sets up Telegram bot command handlers
    */
+  setupTelegramCommands() {
+    if (!this.telegramService) return;
+
+    // Status command - Get current bot status
+    this.telegramService.command('status', async (ctx) => {
+      try {
+        const status = await this.getStatus();
+        await ctx.reply(`🤖 *Bot Status*\n\n` +
+          `📈 *Trading Pair:* ${this.tradingPair}\n` +
+          `💰 *Balance:* ${status.balance} ${this.quoteCurrency}\n` +
+          `📊 *Position:* ${status.position} ${this.baseCurrency} @ ${status.avgPrice} ${this.quoteCurrency}\n` +
+          `📊 *Current Price:* ${status.currentPrice} ${this.quoteCurrency}\n` +
+          `📈 *24h Change:* ${status.priceChange24h}%\n` +
+          `🔄 *Last Trade:* ${status.lastTrade || 'None'}\n` +
+          `⚙️ *Mode:* ${status.isTradingPaused ? '❌ Paused' : '✅ Active'}`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (error) {
+        console.error('Error in status command:', error);
+        await ctx.reply('❌ Error fetching status. Please try again later.');
+      }
+    });
+
+    // Toggle trading command - Pause/resume trading
+    this.telegramService.command('toggle', async (ctx) => {
+      this.isTradingPaused = !this.isTradingPaused;
+      await ctx.reply(`Trading ${this.isTradingPaused ? '❌ Paused' : '✅ Resumed'}`);
+    });
+
+    // Help command - Show available commands
+    this.telegramService.command('help', async (ctx) => {
+      const helpText = `
+🤖 *Bot Commands*:\n\n` +
+        `/status - Show current bot status\n` +
+        `/toggle - Pause/resume trading\n` +
+        `/help - Show this help message`;
+      
+      await ctx.reply(helpText, { parse_mode: 'Markdown' });
+    });
+
+    // Start command with welcome message
+    this.telegramService.command('start', async (ctx) => {
+      const welcomeText = `
+🚀 *Welcome to SYRUP Trading Bot*\n\n` +
+        `I'll help you trade ${this.tradingPair} automatically.\n\n` +
+        `Type /help to see available commands.`;
+      
+      await ctx.reply(welcomeText, { parse_mode: 'Markdown' });
+    });
+
+    console.log('Telegram commands initialized');
+  }
+
+  /**
+   * Gets the current bot status
+   * @returns {Promise<Object>} Status object
+   */
+  async getStatus() {
+    try {
+      const [balance, ticker, position] = await Promise.all([
+        this.coinbaseService.getAccountBalance(this.quoteCurrency),
+        this.coinbaseService.getTicker(this.tradingPair),
+        this.getCurrentPosition()
+      ]);
+
+      return {
+        balance: parseFloat(balance.available).toFixed(2),
+        currentPrice: parseFloat(ticker.price).toFixed(4),
+        priceChange24h: parseFloat(ticker.price_24h_change).toFixed(2),
+        position: position ? position.amount.toFixed(2) : '0.00',
+        avgPrice: position ? position.avgPrice.toFixed(4) : '0.00',
+        lastTrade: this.lastTradeTime ? new Date(this.lastTradeTime).toLocaleString() : 'No trades yet',
+        isTradingPaused: this.isTradingPaused
+      };
+    } catch (error) {
+      console.error('Error getting status:', error);
+      throw new Error('Failed to fetch status');
+    }
+  }
+
+  /**
+   * Sends a trade notification to Telegram
+   * @param {string} message - The message to send
+   * @param {boolean} isError - Whether this is an error message
+   */
+  async sendTelegramNotification(message, isError = false) {
+    if (!this.telegramService?.enabled) return;
+    
+    try {
+      // Format message with emoji and timestamp
+      const formattedMessage = `${isError ? '❌ ' : 'ℹ️ '} *${this.tradingPair}*\n` +
+        `${message}\n` +
+        `_${new Date().toLocaleString()}_`;
+      
+      await this.telegramService.broadcast(formattedMessage, { parse_mode: 'Markdown' });
+    } catch (error) {
+      console.error('Failed to send Telegram notification:', error);
+    }
+  }
+
+  /**
+   * Notifies about a buy order
+   * @param {Object} order - The executed buy order
+   * @param {number} amount - The amount of base currency bought
+   * @param {number} price - The price per unit
+   * @param {number} total - The total cost in quote currency
+   */
+  async notifyBuyOrder(order, amount, price, total) {
+    if (!this.telegramService?.enabled) return;
+    
+    const message = `✅ *BUY ORDER EXECUTED*\n` +
+      `🔹 *Amount:* ${this.formatNumber(amount, 2)} ${this.baseCurrency}\n` +
+      `🔹 *Price:* ${this.formatNumber(price, 4)} ${this.quoteCurrency}\n` +
+      `🔹 *Total:* ${this.formatNumber(total, 2)} ${this.quoteCurrency}\n` +
+      `🔹 *Order ID:* \`${order.id}\``;
+    
+    await this.sendTelegramNotification(message);
+  }
+
+  /**
+   * Notifies about a sell order
+   * @param {Object} order - The executed sell order
+   * @param {number} amount - The amount of base currency sold
+   * @param {number} price - The price per unit
+   * @param {number} total - The total received in quote currency
+   * @param {number} profitPct - The profit percentage
+   */
+  async notifySellOrder(order, amount, price, total, profitPct) {
+    if (!this.telegramService?.enabled) return;
+    
+    const profitEmoji = profitPct >= 0 ? '📈' : '📉';
+    const profitText = profitPct >= 0 ? 'Profit' : 'Loss';
+    
+    const message = `💰 *SELL ORDER EXECUTED*\n` +
+      `🔹 *Amount:* ${this.formatNumber(amount, 2)} ${this.baseCurrency}\n` +
+      `🔹 *Price:* ${this.formatNumber(price, 4)} ${this.quoteCurrency}\n` +
+      `🔹 *Total:* ${this.formatNumber(total, 2)} ${this.quoteCurrency}\n` +
+      `🔹 *${profitText}:* ${profitEmoji} ${Math.abs(profitPct).toFixed(2)}%\n` +
+      `🔹 *Order ID:* \`${order.id}\``;
+    
+    await this.sendTelegramNotification(message);
+  }
+
+  /**
+   * Notifies about an error
+   * @param {string} context - The context where the error occurred
+   * @param {Error} error - The error object
+   */
+  async notifyError(context, error) {
+    if (!this.telegramService?.enabled) return;
+    
+    const errorMessage = error.response?.data?.message || error.message || 'Unknown error';
+    const message = `❌ *ERROR*: ${context}\n` +
+      `\`\`\`\n${errorMessage}\n\`\`\``;
+    
+    await this.sendTelegramNotification(message, true);
+  }
+
+  // Format price or amount with appropriate decimal precision
   formatPrice(price, currency = 'USD') {
     // Handle undefined, null, or empty values
     if (price === undefined || price === null || price === '') {
@@ -3001,7 +3153,7 @@ class SyrupTradingBot {
           },
           timestamp: new Date().toISOString()
         });
-        throw error; // Re-throw to be caught by the outer catch block
+        throw error; // Re-throw to be handled by the outer catch block
       }
       
       logger.info(`${orderLabel} Order placed. ID: ${orderResponse.order_id}`);
@@ -3065,7 +3217,6 @@ class SyrupTradingBot {
       return null;
     }
   }
-  
 
   /**
    * Update the active buy signal after a successful order
@@ -3145,6 +3296,8 @@ class SyrupTradingBot {
       // Clear pending signals after a successful buy to allow new signals
       const pendingCount = this.pendingBuySignals.length;
       this.pendingBuySignals = [];
+      this.lastBuyScore = 0;
+      
       if (pendingCount > 0) {
         logger.info(`Cleared ${pendingCount} pending buy signals after successful buy order`);
       }
@@ -3164,23 +3317,76 @@ class SyrupTradingBot {
    * @param {number} amount - Amount in quote currency
    * @param {Object} [metadata] - Additional trade metadata
    */
-  logTrade(type, price, amount, metadata = {}) {
+  async logTrade(type, price, amount, metadata = {}) {
     try {
       const timestamp = new Date().toISOString();
       const logEntry = {
         timestamp,
         type,
-        pair: this.tradingPair,
-        price: parseFloat(price) || 0,
-        amount: parseFloat(amount) || 0,
+        price,
+        amount,
         ...metadata
       };
       
       // Log to console
       console.log(`[${timestamp}] ${type} ${this.tradingPair} @ ${price} - Amount: ${amount} ${this.quoteCurrency}`);
       
-      // Log to file if needed
-      logger.info('TRADE_EXECUTED', logEntry);
+      // Add to trade history
+      this.tradeHistory.push(logEntry);
+      
+      // Keep only the last 100 trades
+      if (this.tradeHistory.length > 100) {
+        this.tradeHistory.shift();
+      }
+      
+      // Send trade notification to Telegram
+      try {
+        let message = '';
+        const formattedPrice = this.formatPrice(price, this.quoteCurrency);
+        const formattedAmount = this.formatPrice(amount, this.baseCurrency);
+        
+        switch(type) {
+          case 'BUY':
+            message = `🟢 BUY Order Filled\n` +
+                     `💵 Price: ${formattedPrice} ${this.quoteCurrency}\n` +
+                     `📊 Amount: ${formattedAmount} ${this.baseCurrency}\n` +
+                     `💰 Total: ${this.formatPrice(price * amount, this.quoteCurrency)} ${this.quoteCurrency}`;
+            break;
+            
+          case 'SELL_LIMIT':
+            message = `🔴 SELL Order Filled\n` +
+                     `💵 Price: ${formattedPrice} ${this.quoteCurrency}\n` +
+                     `📊 Amount: ${formattedAmount} ${this.baseCurrency}\n`;
+            
+            if (metadata.profit) {
+              const profitPct = (metadata.profit.percent * 100).toFixed(2);
+              message += `💰 Profit: ${this.formatPrice(metadata.profit.amount, this.quoteCurrency)} ${this.quoteCurrency} (${profitPct}%)`;
+            }
+            break;
+            
+          case 'BUY_FAILED':
+            message = `❌ BUY Order Failed\n` +
+                     `💵 Price: ${formattedPrice} ${this.quoteCurrency}\n` +
+                     `📊 Amount: ${formattedAmount} ${this.baseCurrency}\n` +
+                     `⚠️ Reason: ${metadata.reason || 'Unknown'}`;
+            break;
+            
+          case 'SELL_FAILED':
+            message = `❌ SELL Order Failed\n` +
+                     `💵 Price: ${formattedPrice} ${this.quoteCurrency}\n` +
+                     `📊 Amount: ${formattedAmount} ${this.baseCurrency}\n` +
+                     `⚠️ Reason: ${metadata.reason || 'Unknown'}`;
+            break;
+            
+          default:
+            // Don't send notifications for other trade types
+            return logEntry;
+        }
+        
+        await this.telegramService.notify(message);
+      } catch (error) {
+        console.error('Failed to send Telegram notification:', error);
+      }
       
       return logEntry;
     } catch (error) {
