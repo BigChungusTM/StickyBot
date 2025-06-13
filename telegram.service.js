@@ -7,7 +7,7 @@ dotenv.config();
 class TelegramService {
   constructor() {
     this.bot = null;
-    this.chatId = null;
+    this.chatId = process.env.TELEGRAM_CHAT_ID || null;
     this.adminUsername = process.env.TELEGRAM_ADMIN_USERNAME ? 
       process.env.TELEGRAM_ADMIN_USERNAME.toLowerCase() : null;
     this.enabled = false;
@@ -35,13 +35,21 @@ class TelegramService {
 
   initialize() {
     const token = process.env.TELEGRAM_BOT_TOKEN;
-    this.chatId = process.env.TELEGRAM_CHAT_ID;
-    this.enabled = process.env.TELEGRAM_NOTIFICATIONS_ENABLED === 'true' && !!token;
+    this.chatId = process.env.TELEGRAM_CHAT_ID || null;
+    this.enabled = process.env.TELEGRAM_NOTIFICATIONS_ENABLED === 'true' && !!token && !!this.chatId;
 
     if (!this.enabled) {
-      console.log('Telegram notifications are disabled');
+      if (!token) {
+        console.log('Telegram notifications disabled: No bot token provided');
+      } else if (!this.chatId) {
+        console.log('Telegram notifications disabled: No chat ID provided');
+      } else {
+        console.log('Telegram notifications are disabled in config');
+      }
       return;
     }
+    
+    console.log('Initializing Telegram bot with chat ID:', this.chatId);
 
     try {
       this.bot = new Telegraf(token);
@@ -180,22 +188,41 @@ class TelegramService {
   }
 
   async sendMessage(chatId, message, options = {}) {
-    if (!this.enabled || !this.bot) return false;
+    if (!this.enabled) {
+      console.log('Telegram notifications are disabled');
+      return false;
+    }
+    
+    if (!this.bot) {
+      console.error('Telegram bot is not initialized');
+      return false;
+    }
 
     try {
-      const targetChatId = chatId || this.chatId;
+      // Always use the chat ID from the environment variables
+      const targetChatId = this.chatId;
+      
       if (!targetChatId) {
-        console.error('No chat ID provided for Telegram message');
+        console.error('No chat ID configured for Telegram messages');
         return false;
       }
 
+      console.log(`Sending Telegram message to chat ID: ${targetChatId}`);
+      
       await this.bot.telegram.sendMessage(targetChatId, message, {
         parse_mode: 'HTML',
         ...options
       });
+      
+      console.log('Telegram message sent successfully');
       return true;
+      
     } catch (error) {
-      console.error('Failed to send Telegram message:', error);
+      console.error('Failed to send Telegram message:', {
+        error: error.message,
+        chatId: this.chatId,
+        message: message.substring(0, 50) + (message.length > 50 ? '...' : '')
+      });
       return false;
     }
   }
