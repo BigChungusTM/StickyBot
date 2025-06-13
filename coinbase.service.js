@@ -1,6 +1,9 @@
+// Use dynamic import for CommonJS modules
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 const CoinbaseApi = require('coinbase-api');
-const { coinbaseConfig } = require('./config.js');
-// const { v4: uuidv4 } = require('uuid'); // No longer needed
+import { coinbaseConfig } from './config.js';
+// import { v4 as uuidv4 } from 'uuid'; // No longer needed
 
 class CoinbaseService {
   constructor() {
@@ -440,8 +443,9 @@ class CoinbaseService {
   }
 }
 
-const coinbaseServiceInstance = new CoinbaseService();
+// Create and export a single instance of the service
+export const coinbaseService = new CoinbaseService();
 
-module.exports = {
-  coinbaseService: coinbaseServiceInstance
+export default {
+  coinbaseService
 };

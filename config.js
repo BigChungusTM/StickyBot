@@ -1,5 +1,6 @@
 // Load environment variables from .env file
-require('dotenv').config();
+import dotenv from 'dotenv';
+dotenv.config();
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -34,14 +35,18 @@ const tradingConfig = {
 };
 
 // Log configuration (without sensitive data)
-console.log('Loaded configuration:');
-console.log(`- Portfolio: ${coinbaseConfig.portfolioName}`);
-console.log(`- Maker Fee: ${tradingConfig.makerFee}%`);
-console.log(`- Taker Fee: ${tradingConfig.takerFee}%`);
-console.log(`- Profit Threshold: ${tradingConfig.profitThreshold}%`);
-console.log(`- Post-Only Sells: ${tradingConfig.postOnlySells}`);
+if (process.env.NODE_ENV !== 'test') {
+  console.log('Loaded configuration:');
+  console.log(`- Portfolio: ${coinbaseConfig.portfolioName}`);
+  console.log(`- Maker Fee: ${tradingConfig.makerFee}%`);
+  console.log(`- Taker Fee: ${tradingConfig.takerFee}%`);
+  console.log(`- Profit Threshold: ${tradingConfig.profitThreshold}%`);
+  console.log(`- Post-Only Sells: ${tradingConfig.postOnlySells}`);
+}
 
-module.exports = {
+export { coinbaseConfig, tradingConfig };
+
+export default {
   coinbaseConfig,
   tradingConfig
 };

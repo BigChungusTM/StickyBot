@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import axios from 'axios';
+import { coinbaseService } from './coinbase.service.js';
 import { 
   SMA, EMA, RSI, Stochastic, BollingerBands, MACD 
 } from 'technicalindicators';
@@ -305,12 +306,23 @@ try {
 }
 
 class SyrupTradingBot {
-  constructor() {
+  constructor(config = {}) {
+    // Initialize config with defaults
+    this.config = {
+      tradingPair: 'SYRUP-USDC',
+      baseCurrency: 'SYRUP',
+      quoteCurrency: 'USDC',
+      currencySymbol: '$',
+      ...config // Override defaults with provided config
+    };
+    
+    this.processedConfirmations = new Set(); // Track processed confirmations
     this.client = client;
-    this.tradingPair = config.tradingPair;
-    this.baseCurrency = config.baseCurrency;
-    this.quoteCurrency = config.quoteCurrency;
-    this.currencySymbol = config.currencySymbol;
+    this.coinbaseService = coinbaseService; // Initialize coinbaseService
+    this.tradingPair = this.config.tradingPair;
+    this.baseCurrency = this.config.baseCurrency;
+    this.quoteCurrency = this.config.quoteCurrency;
+    this.currencySymbol = this.config.currencySymbol;
     this.accounts = {};
     this.candles = [];
     this.hourlyCandles = []; // Store hourly candles for 24h low calculation
@@ -1899,9 +1911,6 @@ class SyrupTradingBot {
         confirmations: this.activeBuySignal.isActive ? this.activeBuySignal.confirmations : 0
       };
       
-      // Add to pending signals for 2-candle confirmation
-      this.pendingBuySignals.push(newSignal);
-      
       // Log the new signal
       logger.debug('New buy signal detected', {
         timestamp: currentTime.toISOString(),
@@ -1956,22 +1965,68 @@ class SyrupTradingBot {
         }
       }
       
-      // Add to pending signals for 2-candle confirmation
-      this.pendingBuySignals.push(newSignal);
-      logger.debug('Added to pending signals', { 
-        totalPending: this.pendingBuySignals.length,
-        score: techScore.score 
-      });
+      // Check if we already have a very similar signal in the queue
+      const isDuplicate = this.pendingBuySignals.some(signal => 
+        Math.abs(signal.price - newSignal.price) < 0.0001 && // Same price (with small epsilon)
+        Math.abs(signal.score - newSignal.score) < 0.1 &&    // Similar score
+        new Date() - new Date(signal.timestamp) < 60000      // Within last minute
+      );
+      
+      if (!isDuplicate) {
+        this.pendingBuySignals.push(newSignal);
+        logger.debug('Added new signal to pending queue', { 
+          totalPending: this.pendingBuySignals.length,
+          score: techScore.score,
+          price: newSignal.price,
+          timestamp: newSignal.timestamp
+        });
+      } else {
+        logger.debug('Skipping duplicate signal', {
+          price: newSignal.price,
+          score: newSignal.score,
+          timestamp: newSignal.timestamp
+        });
+      }
     }
     
     // Check for 2-candle confirmation
     const confirmation = this.getTwoCandleConfirmation();
-    const isConfirmed = (confirmation.confirmed || 
-                      (this.activeBuySignal.isActive && this.activeBuySignal.confirmations >= 2)) && 
+    const hasEnoughConfirmations = this.activeBuySignal.isActive && this.activeBuySignal.confirmations >= 2;
+    const isConfirmed = (confirmation.confirmed || hasEnoughConfirmations) && 
                       totalScore >= this.buyConfig.minScore;
     
-    // If we have a confirmed signal, execute the buy order immediately
-    if (isConfirmed && this.activeBuySignal.isActive) {
+    // Debug log for confirmation status
+    if (isConfirmed) {
+      logger.debug('Confirmation check', {
+        confirmed: confirmation.confirmed,
+        hasEnoughConfirmations,
+        totalScore,
+        minScore: this.buyConfig.minScore,
+        activeSignal: this.activeBuySignal.isActive,
+        confirmations: this.activeBuySignal.confirmations
+      });
+    }
+    
+    // If we have a confirmed signal and we haven't already processed this confirmation
+    const confirmationKey = `${this.activeBuySignal.signalPrice.toFixed(8)}-${this.activeBuySignal.signalTime}`;
+    const isNewConfirmation = isConfirmed && 
+                            this.activeBuySignal.isActive && 
+                            !this.processedConfirmations.has(confirmationKey);
+                            
+    if (isNewConfirmation) {
+      // Mark this confirmation as processed
+      this.processedConfirmations.add(confirmationKey);
+      
+      // Clean up old confirmations (keep last 10 minutes)
+      const now = Date.now();
+      for (const key of this.processedConfirmations) {
+        const [price, time] = key.split('-');
+        if (now - new Date(time).getTime() > 10 * 60 * 1000) { // 10 minutes
+          this.processedConfirmations.delete(key);
+        }
+      }
+      // Mark this confirmation as processed to prevent duplicates
+      this.activeBuySignal.confirmationProcessed = true;
       this.activeBuySignal.confirmations = 2; // Ensure we have 2 confirmations
       this.activeBuySignal.lastConfirmationTime = currentTime;
       
@@ -1989,6 +2044,8 @@ class SyrupTradingBot {
         await this.placeBuyOrder(currentPrice, 'CONFIRMED');
       } catch (error) {
         logger.error('Failed to execute buy order after confirmation:', error);
+        // Reset confirmation processed flag on error to allow retry
+        this.activeBuySignal.confirmationProcessed = false;
       }
     }
     
@@ -2316,7 +2373,7 @@ class SyrupTradingBot {
         `Order Type: limit, ` +
         `Time in Force: GTC`);
       
-      const orderResponse = await coinbaseService.submitOrder(
+      const orderResponse = await this.coinbaseService.submitOrder(
         formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
         'SELL',               // side
         amount,               // size - amount of SYRUP to sell
@@ -2431,17 +2488,37 @@ class SyrupTradingBot {
         `Order Type: market`);
       
       // Place the market buy order
-      const orderResponse = await coinbaseService.submitOrder(
-        formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
-        'BUY',                 // side
-        positionSize,          // size in base currency (SYRUP)
-        'market',              // orderType
-        null,                  // price (not needed for market orders)
-        false                  // postOnly (false for market orders)
-      );
-      
-      if (!orderResponse?.order_id) {
-        throw new Error('Invalid order response: missing order_id');
+      let orderResponse;
+      try {
+        orderResponse = await this.coinbaseService.submitOrder(
+          formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
+          'BUY',                 // side
+          positionSize,          // size in base currency (SYRUP)
+          'market',              // orderType
+          null,                  // price (not needed for market orders)
+          false                  // postOnly (false for market orders)
+        );
+        
+        if (!orderResponse?.order_id) {
+          throw new Error(`Invalid order response: ${JSON.stringify(orderResponse || {}, null, 2)}`);
+        }
+      } catch (error) {
+        // Log the full error details for debugging
+        logger.error(`${orderLabel} Order submission failed:`, {
+          error: error.message,
+          stack: error.stack,
+          response: error.response?.data,
+          request: {
+            productId: formattedTradingPair,
+            side: 'BUY',
+            size: positionSize,
+            orderType: 'market',
+            price: null,
+            postOnly: false
+          },
+          timestamp: new Date().toISOString()
+        });
+        throw error; // Re-throw to be caught by the outer catch block
       }
       
       logger.info(`${orderLabel} Order placed. ID: ${orderResponse.order_id}`);
@@ -2757,16 +2834,19 @@ class SyrupTradingBot {
       
       for (const account of accounts) {
         if ([this.baseCurrency, this.quoteCurrency].includes(account.currency)) {
-          // Try different property names for balance
-          const availableBalance = account.available_balance?.value || 
-                                 account.available_balance || 
-                                 account.balance?.available || 
-                                 '0';
+          // Try different property names for balance, including EurBalance for USDC
+          const availableBalance = 
+            (account.currency === 'USDC' && account.EurBalance) ? account.EurBalance :
+            account.available_balance?.value || 
+            account.available_balance || 
+            account.balance?.available || 
+            '0';
           
-          const holdBalance = account.hold?.value || 
-                            account.hold || 
-                            account.balance?.hold || 
-                            '0';
+          const holdBalance = 
+            account.hold?.value || 
+            account.hold || 
+            account.balance?.hold || 
+            '0';
           
           // Parse and validate the balance values
           const available = parseFloat(availableBalance);
