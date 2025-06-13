@@ -1,5 +1,8 @@
 # SyrupBot Trading System
-Please Note: This is 100% Vibe Coded. There is a current task list with changes that is updated in planning steps that shows where current functionality sits.
+
+**Note:** This is a high-frequency trading bot specifically designed for the SYRUP-USDC trading pair on Coinbase Advanced Trade. The bot uses a sophisticated 21-point scoring system with 2-candle confirmation to identify high-probability trading opportunities.
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/donate/?business=jolardy%40hotmail.co.uk&no_recurring=0&item_name=Support+SyrupBot+Development&currency_code=USD)
 
 ## Overview
 SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRUP-USDC trading pair. The bot uses a sophisticated scoring system combining technical indicators, dip detection, and 24-hour low proximity to identify high-probability trading opportunities. It executes trades through the Coinbase Advanced Trade API.
@@ -157,7 +160,7 @@ This project is licensed under the GNU General Public License v3.0. See the [LIC
 
 If you find this project useful and would like to support its development, please consider making a donation:
 
-[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/yourpaypal)
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.com/donate/?business=jolardy%40hotmail.co.uk&no_recurring=0&item_name=Support+SyrupBot+Development&currency_code=USD)
 
 Your support helps keep this project maintained and improved!
 

@@ -1909,6 +1909,12 @@ class SyrupTradingBot {
       }
     }
     
+    // Clean up old signals (older than 5 minutes) at the start of each evaluation
+    const fiveMinutesAgo = new Date(currentTime - 5 * 60 * 1000);
+    this.pendingBuySignals = this.pendingBuySignals.filter(
+      signal => new Date(signal.timestamp) >= fiveMinutesAgo
+    );
+
     // Add to pending signals if total score is good enough
     if (totalScore >= this.buyConfig.minScore) {
       const newSignal = {
@@ -1919,7 +1925,9 @@ class SyrupTradingBot {
         techScore: techScore.score, // Individual component scores for reference
         dipScore: dipScore.score,
         low24hScore: low24hScore.score,
-        confirmations: this.activeBuySignal.isActive ? this.activeBuySignal.confirmations : 0
+        confirmations: this.activeBuySignal.isActive ? this.activeBuySignal.confirmations : 0,
+        // Add a unique identifier for this signal
+        id: `${currentTime.getTime()}-${currentPrice.toFixed(8)}`
       };
       
       // Log the new signal
@@ -1941,14 +1949,16 @@ class SyrupTradingBot {
           confirmations: 1,
           lastConfirmationTime: currentTime,
           orderIds: [],
-          initialScore: totalScore // Store the initial score for reference
+          initialScore: totalScore, // Store the initial score for reference
+          signalId: newSignal.id // Track which signal triggered this buy
         };
         logger.info('New buy signal activated', { 
           price: currentPrice,
           totalScore: totalScore,
           techScore: techScore.score,
           dipScore: dipScore.score,
-          low24hScore: low24hScore.score
+          low24hScore: low24hScore.score,
+          signalId: newSignal.id
         });
       } else {
         // Only increment confirmation if this is a new candle (at least 1 minute since last confirmation)
@@ -1965,37 +1975,52 @@ class SyrupTradingBot {
               prevConfirmations: this.activeBuySignal.confirmations - 1,
               newConfirmations: newConfirmations,
               totalScore: totalScore,
-              minutesSinceLastConfirmation: minutesSinceLastConfirmation.toFixed(2)
+              minutesSinceLastConfirmation: minutesSinceLastConfirmation.toFixed(2),
+              signalId: this.activeBuySignal.signalId
             });
           } else {
             logger.debug('Skipping confirmation increment - score below threshold', {
               totalScore: totalScore,
-              minRequired: this.buyConfig.minScore
+              minRequired: this.buyConfig.minScore,
+              signalId: this.activeBuySignal.signalId
             });
           }
         }
       }
       
       // Check if we already have a very similar signal in the queue
-      const isDuplicate = this.pendingBuySignals.some(signal => 
-        Math.abs(signal.price - newSignal.price) < 0.0001 && // Same price (with small epsilon)
-        Math.abs(signal.score - newSignal.score) < 0.1 &&    // Similar score
-        new Date() - new Date(signal.timestamp) < 60000      // Within last minute
-      );
+      const isDuplicate = this.pendingBuySignals.some(signal => {
+        const timeDiff = Math.abs(new Date(signal.timestamp) - currentTime) / 1000; // in seconds
+        return (
+          // Same price (with small epsilon) and similar score within 10 seconds
+          (Math.abs(signal.price - newSignal.price) < 0.0001 && 
+           Math.abs(signal.score - newSignal.score) < 0.1 &&
+           timeDiff < 10) ||
+          // Or same signal ID (for deduplication after restarts)
+          signal.id === newSignal.id
+        );
+      });
       
       if (!isDuplicate) {
+        // Keep only the most recent 5 signals to prevent queue bloat
+        if (this.pendingBuySignals.length >= 5) {
+          this.pendingBuySignals.shift(); // Remove oldest signal
+        }
+        
         this.pendingBuySignals.push(newSignal);
         logger.debug('Added new signal to pending queue', { 
           totalPending: this.pendingBuySignals.length,
           score: techScore.score,
           price: newSignal.price,
-          timestamp: newSignal.timestamp
+          timestamp: newSignal.timestamp,
+          signalId: newSignal.id
         });
       } else {
         logger.debug('Skipping duplicate signal', {
           price: newSignal.price,
           score: newSignal.score,
-          timestamp: newSignal.timestamp
+          timestamp: newSignal.timestamp,
+          signalId: newSignal.id
         });
       }
     }
