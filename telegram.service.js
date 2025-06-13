@@ -8,8 +8,29 @@ class TelegramService {
   constructor() {
     this.bot = null;
     this.chatId = null;
+    this.adminUsername = process.env.TELEGRAM_ADMIN_USERNAME ? 
+      process.env.TELEGRAM_ADMIN_USERNAME.toLowerCase() : null;
     this.enabled = false;
     this.initialize();
+  }
+
+  // Helper method to check if a user is authorized
+  isAuthorizedUser(ctx) {
+    if (!this.adminUsername) return true; // No admin username set, allow all
+    
+    const username = ctx.from?.username?.toLowerCase();
+    if (!username) return false; // No username, not authorized
+    
+    return username === this.adminUsername;
+  }
+
+  // Helper method to send unauthorized message
+  async sendUnauthorizedMessage(chatId) {
+    return this.sendMessage(
+      chatId,
+      '⛔ *Unauthorized*\n\nYou do not have permission to use this command.',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   initialize() {
@@ -47,9 +68,28 @@ class TelegramService {
     this.bot.command(command, handler);
   }
 
-  setupCommands() {
+  /**
+   * Set up command handlers with the trading bot instance
+   * @param {Object} tradingBot - Instance of the trading bot
+   */
+  setupCommands(tradingBot) {
+    console.log('Setting up Telegram commands with trading bot instance:', tradingBot ? 'Valid' : 'Invalid');
+    if (!this.bot) {
+      console.error('Telegram bot not initialized');
+      return;
+    }
+
+    // Store the trading bot instance
+    this.tradingBot = tradingBot;
+
+    // Add the bot instance to the context for all commands
+    this.bot.use((ctx, next) => {
+      ctx.tradingBot = this.tradingBot;
+      return next();
+    });
+
     // Start command
-    this.command('start', (ctx) => {
+    this.bot.command('start', (ctx) => {
       this.sendMessage(ctx.chat.id, '🚀 SYRUP Trading Bot is running! Use /help to see available commands.');
     });
 
@@ -69,20 +109,73 @@ class TelegramService {
 
     // Status command
     this.bot.command('status', async (ctx) => {
-      // This will be implemented to return bot status
-      this.sendMessage(ctx.chat.id, 'Status command handler will be implemented');
+      try {
+        await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+        this.sendMessage(ctx.chat.id, 'Status command handler will be implemented');
+      } catch (error) {
+        console.error('Error in status command:', error);
+        this.sendMessage(ctx.chat.id, '❌ Error getting status. Please try again later.');
+      }
     });
 
     // Balance command
     this.bot.command('balance', async (ctx) => {
-      // This will be implemented to return balances
-      this.sendMessage(ctx.chat.id, 'Balance command handler will be implemented');
+      try {
+        // Show typing indicator
+        await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+        
+        // Get and send balances
+        const balanceMessage = await this.tradingBot.getFormattedBalances();
+        await this.sendMessage(ctx.chat.id, balanceMessage, { parse_mode: 'Markdown' });
+      } catch (error) {
+        console.error('Error in balance command:', error);
+        await this.sendMessage(ctx.chat.id, '❌ Error fetching balances. Please try again later.');
+      }
     });
 
-    // Trades command
+    // Admin command wrapper
+    this.adminCommand = (command, handler) => {
+      this.bot.command(command, async (ctx) => {
+        if (!this.isAuthorizedUser(ctx)) {
+          return this.sendUnauthorizedMessage(ctx.chat.id);
+        }
+        return handler(ctx);
+      });
+    };
+
+    // Trades command - Public
     this.bot.command('trades', async (ctx) => {
-      // This will be implemented to return recent trades
-      this.sendMessage(ctx.chat.id, 'Trades command handler will be implemented');
+      try {
+        await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+        this.sendMessage(ctx.chat.id, 'Trades command handler will be implemented');
+      } catch (error) {
+        console.error('Error in trades command:', error);
+        this.sendMessage(ctx.chat.id, '❌ Error fetching trades. Please try again later.');
+      }
+    });
+
+    // Pause command - Admin only
+    this.adminCommand('pause', async (ctx) => {
+      try {
+        await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+        // Implementation will be added
+        await this.sendMessage(ctx.chat.id, '⏸ Trading has been paused');
+      } catch (error) {
+        console.error('Error in pause command:', error);
+        await this.sendMessage(ctx.chat.id, '❌ Error pausing trading. Please try again later.');
+      }
+    });
+
+    // Resume command - Admin only
+    this.adminCommand('resume', async (ctx) => {
+      try {
+        await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+        // Implementation will be added
+        await this.sendMessage(ctx.chat.id, '▶️ Trading has been resumed');
+      } catch (error) {
+        console.error('Error in resume command:', error);
+        await this.sendMessage(ctx.chat.id, '❌ Error resuming trading. Please try again later.');
+      }
     });
   }
 

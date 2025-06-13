@@ -453,6 +453,58 @@ class SyrupTradingBot {
     }
   }
 
+  async getAccountBalances() {
+    try {
+      const accounts = await this.client.rest.account.listAccounts();
+      this.accounts = accounts.reduce((acc, account) => ({
+        ...acc,
+        [account.currency]: account
+      }), {});
+      return this.accounts;
+    } catch (error) {
+      console.error('Error fetching account balances:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get formatted account balances for display
+   * @returns {Promise<string>} Formatted balance string
+   */
+  async getFormattedBalances() {
+    try {
+      const accounts = await this.getAccountBalances();
+      const baseBalance = accounts[this.baseCurrency]?.available || '0.0';
+      const quoteBalance = accounts[this.quoteCurrency]?.available || '0.0';
+      
+      return `💰 *Account Balances* \n` +
+             `${this.baseCurrency}: *${parseFloat(baseBalance).toFixed(2)}*\n` +
+             `${this.quoteCurrency}: *${parseFloat(quoteBalance).toFixed(2)}*`;
+    } catch (error) {
+      console.error('Error getting formatted balances:', error);
+      return '❌ Error fetching account balances. Please try again later.';
+    }
+  }
+
+  /**
+   * Get formatted account balances for display
+   * @returns {Promise<string>} Formatted balance string
+   */
+  async getFormattedBalances() {
+    try {
+      const accounts = await this.getAccountBalances();
+      const baseBalance = accounts[this.baseCurrency]?.available || '0.0';
+      const quoteBalance = accounts[this.quoteCurrency]?.available || '0.0';
+      
+      return `💰 *Account Balances* \n` +
+             `${this.baseCurrency}: *${parseFloat(baseBalance).toFixed(2)}*\n` +
+             `${this.quoteCurrency}: *${parseFloat(quoteBalance).toFixed(2)}*`;
+    } catch (error) {
+      console.error('Error getting formatted balances:', error);
+      return '❌ Error fetching account balances. Please try again later.';
+    }
+  }
+
   async initialize() {
     // Prevent multiple initializations
     if (this._isInitializing) {
@@ -2465,54 +2517,14 @@ class SyrupTradingBot {
    * Sets up Telegram bot command handlers
    */
   setupTelegramCommands() {
-    if (!this.telegramService) return;
-
-    // Status command - Get current bot status
-    this.telegramService.command('status', async (ctx) => {
-      try {
-        const status = await this.getStatus();
-        await ctx.reply(`🤖 *Bot Status*\n\n` +
-          `📈 *Trading Pair:* ${this.tradingPair}\n` +
-          `💰 *Balance:* ${status.balance} ${this.quoteCurrency}\n` +
-          `📊 *Position:* ${status.position} ${this.baseCurrency} @ ${status.avgPrice} ${this.quoteCurrency}\n` +
-          `📊 *Current Price:* ${status.currentPrice} ${this.quoteCurrency}\n` +
-          `📈 *24h Change:* ${status.priceChange24h}%\n` +
-          `🔄 *Last Trade:* ${status.lastTrade || 'None'}\n` +
-          `⚙️ *Mode:* ${status.isTradingPaused ? '❌ Paused' : '✅ Active'}`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (error) {
-        console.error('Error in status command:', error);
-        await ctx.reply('❌ Error fetching status. Please try again later.');
-      }
-    });
-
-    // Toggle trading command - Pause/resume trading
-    this.telegramService.command('toggle', async (ctx) => {
-      this.isTradingPaused = !this.isTradingPaused;
-      await ctx.reply(`Trading ${this.isTradingPaused ? '❌ Paused' : '✅ Resumed'}`);
-    });
-
-    // Help command - Show available commands
-    this.telegramService.command('help', async (ctx) => {
-      const helpText = `
-🤖 *Bot Commands*:\n\n` +
-        `/status - Show current bot status\n` +
-        `/toggle - Pause/resume trading\n` +
-        `/help - Show this help message`;
-      
-      await ctx.reply(helpText, { parse_mode: 'Markdown' });
-    });
-
-    // Start command with welcome message
-    this.telegramService.command('start', async (ctx) => {
-      const welcomeText = `
-🚀 *Welcome to SYRUP Trading Bot*\n\n` +
-        `I'll help you trade ${this.tradingPair} automatically.\n\n` +
-        `Type /help to see available commands.`;
-      
-      await ctx.reply(welcomeText, { parse_mode: 'Markdown' });
-    });
+    if (!this.telegramService || !this.telegramService.enabled) return;
+    
+    console.log('Setting up Telegram commands...');
+    
+    // Pass the bot instance to the Telegram service
+    this.telegramService.setupCommands(this);
+    
+    console.log('Telegram commands set up successfully');
 
     console.log('Telegram commands initialized');
   }
