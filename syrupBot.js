@@ -357,6 +357,7 @@ class SyrupTradingBot {
       minPositionSize: 7,     // Minimum position size in quote currency (7 USDC)
       positionSizePercent: 20, // Percentage of available balance to use per buy
       maxDollarCostAveraging: 3, // Maximum number of times to DCA into a position
+      profitTargetPercent: 4.0,  // 4% profit target for limit sells
       // 24h low scoring configuration - points based on % above 24h low
       low24hScoreRanges: [
         { maxPercent: 1.0, score: 10 },   // 0-1% above 24h low: 10 points
@@ -1052,12 +1053,7 @@ class SyrupTradingBot {
           startTime = new Date(now.getTime() - 3600000);
         }
         
-        // Ensure start time is not in the future
-        if (startTime > now) {
-          startTime = new Date(now.getTime() - 3600000); // Default to 1 hour ago
-        }
-        
-        // Ensure end time is not before start time
+        // Ensure start time is not before end time
         if (endTime <= startTime) {
           logger.warn('End time is not after start time, adjusting...');
           startTime = new Date(endTime.getTime() - 3600000); // Set start to 1 hour before end
@@ -1935,7 +1931,7 @@ class SyrupTradingBot {
         timestamp: currentTime.toISOString(),
         totalScore: totalScore,
         techScore: techScore.score,
-        price: currentPrice,
+        price: newSignal.price,
         hasActiveSignal: this.activeBuySignal.isActive,
         currentConfirmations: this.activeBuySignal.confirmations
       });
@@ -2409,21 +2405,6 @@ class SyrupTradingBot {
       // Subtract 0.1 SYRUP to account for any rounding errors and ensure the order goes through
       const adjustedAmount = Math.max(0.1, amount - 0.1); // Ensure we don't go below 0.1
       
-      // Format the amount to 1 decimal place for SYRUP
-      const formattedAmount = parseFloat(adjustedAmount.toFixed(1));
-      
-      logger.info(`Adjusted sell amount from ${amount.toFixed(1)} to ${formattedAmount} ${this.baseCurrency} to prevent rounding errors`);
-      
-      // Calculate sell price with 3.5% profit
-      const sellPrice = buyPrice * 1.035;
-      
-      logger.info(`Placing limit sell order for ${formattedAmount} ${this.baseCurrency} ` +
-                 `@ ${sellPrice.toFixed(4)} ${this.quoteCurrency} (3.5% above buy price)`);
-      
-      // Place the limit sell order (GTC - Good Till Cancelled)
-      // For limit sell, we specify the amount of base currency (SYRUP) to sell
-      const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
-      
       logger.info(`Limit sell order details - ` +
         `Trading Pair: ${formattedTradingPair}, ` +
         `Base: ${this.baseCurrency}, ` +
@@ -2620,8 +2601,8 @@ class SyrupTradingBot {
         this.updateBuySignalAfterOrder(price, positionSize * price, orderResponse);
         this.lastBuyTime = Date.now();
         
-        // Place a limit sell order for this buy (3.5% profit target)
-        if (positionSize > 0) {
+        // Place a limit sell order for this buy (4% profit target)
+      if (positionSize > 0) {
           try {
             const formattedSellSize = this.formatPrice(positionSize, this.baseCurrency);
             logger.info(`Placing limit sell order for ${formattedSellSize} ${this.baseCurrency}...`);

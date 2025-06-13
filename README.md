@@ -2,8 +2,6 @@
 
 **Note:** This is a high-frequency trading bot specifically designed for the SYRUP-USDC trading pair on Coinbase Advanced Trade. The bot uses a sophisticated 21-point scoring system with 2-candle confirmation to identify high-probability trading opportunities.
 
-[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://www.paypal.me/jolardy)
-
 ## Overview
 SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRUP-USDC trading pair. The bot uses a sophisticated scoring system combining technical indicators, dip detection, and 24-hour low proximity to identify high-probability trading opportunities. It executes trades through the Coinbase Advanced Trade API.
 
