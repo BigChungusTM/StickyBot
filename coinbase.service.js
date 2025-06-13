@@ -398,13 +398,34 @@ class CoinbaseService {
         if (!price) throw new Error('Limit orders require a price');
         
         if (sideUpper === 'BUY' || sideUpper === 'SELL') {
+          // For limit orders, we need to use limit_limit_gtc configuration
+          // Format price and size with correct decimal places
+          const [base, quote] = productId.split('-').map(c => c.toUpperCase());
+          const baseDecimals = base === 'SYRUP' ? 1 : 4;  // SYRUP uses 1 decimal, others use 4
+          const quoteDecimals = 4;  // USDC uses 4 decimals
+          
+          // Format the price and size with correct decimal places
+          const formattedPrice = parseFloat(price).toFixed(quoteDecimals);
+          const baseSize = parseFloat(sizeStr).toFixed(baseDecimals);
+          
+          // Calculate quote size (price * size) with proper decimal places
+          const quoteSize = (parseFloat(price) * parseFloat(sizeStr)).toFixed(quoteDecimals);
+          
+          // For limit orders, we only need to specify the base_size and limit_price
+          // The API will calculate the quote_size automatically
           orderConfiguration = {
             limit_limit_gtc: {
-              base_size: sizeStr,
-              price: price.toString(),
-              post_only: !!postOnly
+              base_size: baseSize,      // Amount of base currency to buy/sell (e.g., SYRUP)
+              limit_price: formattedPrice, // Price per unit in quote currency
+              post_only: !!postOnly,     // Whether to be a maker order only
+              rfq_disabled: true        // Route to exchange CLOB
             }
           };
+          
+          // Remove quote_size as it's not needed and might be causing issues
+          delete orderConfiguration.limit_limit_gtc.quote_size;
+          
+          console.log('Limit order configuration:', JSON.stringify(orderConfiguration, null, 2));
         } else {
           throw new Error('Invalid side for limit order. Must be BUY or SELL.');
         }
@@ -426,19 +447,37 @@ class CoinbaseService {
       console.log('Order submission successful:', JSON.stringify(response, null, 2));
       return response;
     } catch (error) {
-      const errorMessage = `Error submitting ${orderType} ${side} order for ${productId}: ${error.message || error}`;
-      console.error(errorMessage);
+      let errorMessage = `Error submitting ${orderType} ${side} order for ${productId}: `;
       
-      // Log additional error details if available
+      // Extract detailed error information
       if (error.response) {
-        console.error('Error response status:', error.response.status);
-        if (error.response.data) {
-          console.error('Error response data:', JSON.stringify(error.response.data, null, 2));
+        const { status, statusText, data } = error.response;
+        errorMessage += `[${status}] ${statusText}`;
+        
+        console.error('Error response:', {
+          status,
+          statusText,
+          url: error.response.config?.url,
+          method: error.response.config?.method,
+          requestData: error.response.config?.data ? JSON.parse(error.response.config.data) : null,
+          responseData: data
+        });
+        
+        if (data && data.error) {
+          errorMessage += ` - ${data.error}`;
+          if (data.message) errorMessage += `: ${data.message}`;
+          if (data.error_details) errorMessage += ` (${JSON.stringify(data.error_details)})`;
         }
+      } else {
+        errorMessage += error.message || 'Unknown error';
       }
       
-      // Re-throw with a more descriptive error message
-      throw new Error(errorMessage);
+      console.error(errorMessage);
+      
+      // Re-throw with the detailed error message
+      const detailedError = new Error(errorMessage);
+      detailedError.originalError = error;
+      throw detailedError;
     }
   }
 }

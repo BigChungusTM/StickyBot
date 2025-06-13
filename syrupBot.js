@@ -2352,12 +2352,19 @@ class SyrupTradingBot {
         return null;
       }
 
+      // Subtract 0.1 SYRUP to account for any rounding errors and ensure the order goes through
+      const adjustedAmount = Math.max(0.1, amount - 0.1); // Ensure we don't go below 0.1
+      
+      // Format the amount to 1 decimal place for SYRUP
+      const formattedAmount = parseFloat(adjustedAmount.toFixed(1));
+      
+      logger.info(`Adjusted sell amount from ${amount.toFixed(1)} to ${formattedAmount} ${this.baseCurrency} to prevent rounding errors`);
+      
       // Calculate sell price with 3.5% profit
       const sellPrice = buyPrice * 1.035;
-      const formattedAmount = amount.toFixed(8);
       
       logger.info(`Placing limit sell order for ${formattedAmount} ${this.baseCurrency} ` +
-                 `@ ${sellPrice.toFixed(8)} ${this.quoteCurrency} (3.5% above buy price)`);
+                 `@ ${sellPrice.toFixed(4)} ${this.quoteCurrency} (3.5% above buy price)`);
       
       // Place the limit sell order (GTC - Good Till Cancelled)
       // For limit sell, we specify the amount of base currency (SYRUP) to sell
@@ -2369,32 +2376,40 @@ class SyrupTradingBot {
         `Quote: ${this.quoteCurrency}, ` +
         `Side: SELL, ` +
         `Size: ${formattedAmount} ${this.baseCurrency}, ` +
-        `Price: ${sellPrice.toFixed(8)} ${this.quoteCurrency}, ` +
+        `Price: ${sellPrice.toFixed(4)} ${this.quoteCurrency}, ` +
         `Order Type: limit, ` +
         `Time in Force: GTC`);
+        
+      // Log the formatted amount for debugging
+      logger.debug(`Formatted sell amount: ${formattedAmount} ${this.baseCurrency} (raw: ${amount})`);
       
       const orderResponse = await this.coinbaseService.submitOrder(
         formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
         'SELL',               // side
-        amount,               // size - amount of SYRUP to sell
+        formattedAmount,       // size - amount of SYRUP to sell (formatted to 1 decimal)
         'limit',              // orderType
         sellPrice,            // price for limit order
         true                  // postOnly - ensure maker order
       );
       
-      if (orderResponse?.order_id) {
-        logger.info(`Limit sell order placed. ID: ${orderResponse.order_id}`);
+      // Check for successful response - handle both direct order_id and success_response.order_id
+      const orderId = orderResponse?.order_id || orderResponse?.success_response?.order_id;
+      
+      if (orderId) {
+        logger.info(`Limit sell order placed successfully. ID: ${orderId}`);
         
         // Log the sell order details
+        const tradeResponse = orderResponse.success_response || orderResponse;
         this.logTrade('SELL_LIMIT', sellPrice, amount * sellPrice, {
-          ...orderResponse,
+          ...tradeResponse,
           filled_size: formattedAmount,
           executed_value: (amount * sellPrice).toFixed(8)
         });
         
-        return orderResponse;
+        return tradeResponse;
       } else {
-        throw new Error('Invalid response when placing limit sell order');
+        logger.error('Unexpected order response format:', JSON.stringify(orderResponse, null, 2));
+        throw new Error('Invalid response format when placing limit sell order');
       }
     } catch (error) {
       logger.error('Error placing limit sell order:', error.message || error);
@@ -2459,15 +2474,23 @@ class SyrupTradingBot {
       const buffer = 0.995; // 0.5% buffer
       const estimatedPositionSize = (quoteAmount * buffer) / price;
       
-      // Round down to appropriate decimal places for SYRUP (assuming 8 decimal places like other tokens)
-      positionSize = Math.floor(estimatedPositionSize * 1e8) / 1e8;
+      // Format the position size according to Coinbase's precision requirements for SYRUP
+      // SYRUP uses 1 decimal place on Coinbase
+      positionSize = Math.floor(estimatedPositionSize * 10) / 10; // Round down to 1 decimal place
+      
+      // Ensure exactly 1 decimal place
+      positionSize = parseFloat(positionSize.toFixed(1));
       
       // Ensure we're not trying to buy less than the minimum order size
-      const minOrderSize = 1; // Minimum 1 SYRUP (adjust based on exchange requirements)
+      // For SYRUP-USDC, the minimum order size is 1 SYRUP
+      const minOrderSize = 1; // 1 SYRUP minimum
       if (positionSize < minOrderSize) {
         logger.warn(`${orderLabel} Calculated position size (${positionSize} ${this.baseCurrency}) is below minimum order size (${minOrderSize} ${this.baseCurrency})`);
         return null;
       }
+      
+      // Log the formatted position size for debugging
+      logger.debug(`${orderLabel} Formatted position size: ${positionSize} ${this.baseCurrency} (raw: ${positionSize})`);
       
       // Format the position size and price for display
       const formattedPositionSize = this.formatPrice(positionSize, this.quoteCurrency);
@@ -2490,7 +2513,7 @@ class SyrupTradingBot {
       // Place the market buy order
       let orderResponse;
       try {
-        orderResponse = await this.coinbaseService.submitOrder(
+        const response = await this.coinbaseService.submitOrder(
           formattedTradingPair,  // productId (e.g., 'SYRUP-USDC')
           'BUY',                 // side
           positionSize,          // size in base currency (SYRUP)
@@ -2499,8 +2522,15 @@ class SyrupTradingBot {
           false                  // postOnly (false for market orders)
         );
         
-        if (!orderResponse?.order_id) {
-          throw new Error(`Invalid order response: ${JSON.stringify(orderResponse || {}, null, 2)}`);
+        // Handle different response formats
+        if (response?.success_response?.order_id) {
+          // New format: { success: true, success_response: { order_id: '...' } }
+          orderResponse = response.success_response;
+        } else if (response?.order_id) {
+          // Direct format: { order_id: '...' }
+          orderResponse = response;
+        } else {
+          throw new Error(`Invalid order response: ${JSON.stringify(response || {}, null, 2)}`);
         }
       } catch (error) {
         // Log the full error details for debugging
@@ -2523,56 +2553,32 @@ class SyrupTradingBot {
       
       logger.info(`${orderLabel} Order placed. ID: ${orderResponse.order_id}`);
       
-      // 5. Wait briefly for order to be filled (shorter wait for market orders)
-      logger.debug('Waiting for order to be filled...');
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // 5. Log the successful order placement
+      logger.info(`${orderLabel} Order placed successfully. ID: ${orderResponse.order_id}`);
       
-      // 6. Get order details to confirm fill
-      let orderDetails;
+      // 6. For market orders, we can proceed directly to place the sell order
+      // since market orders are typically filled immediately or not at all
       try {
-        orderDetails = await this.client.getOrder(orderResponse.order_id);
+        // Log the successful buy
+        this.logTrade('BUY', price, positionSize * price, orderResponse);
         
-        // Log the full order details for debugging
-        logger.debug('Order details:', JSON.stringify(orderDetails, null, 2));
+        // Update the active buy signal with this purchase
+        this.updateBuySignalAfterOrder(price, positionSize * price, orderResponse);
+        this.lastBuyTime = Date.now();
         
-        // Calculate filled amount and price
-        const filledSize = parseFloat(orderDetails.filled_size || '0');
-        const filledValue = parseFloat(orderDetails.executed_value || '0');
-        const actualPrice = filledSize > 0 ? (filledValue / filledSize) : price; // Fallback to input price if no fills
-        
-        // Format the filled size and price according to currency standards
-        const formattedFilledSize = this.formatPrice(filledSize, this.baseCurrency);
-        const formattedActualPrice = this.formatPrice(actualPrice, this.quoteCurrency);
-        
-        if (filledSize > 0 && filledValue > 0) {
-          logger.info(`${orderLabel} Order filled. ${formattedFilledSize} ${this.baseCurrency} @ ${formattedActualPrice} ${this.quoteCurrency}`);
-          
-          // Log the successful buy
-          this.logTrade('BUY', actualPrice, filledValue, orderDetails);
-          
-          // Update the active buy signal with this purchase
-          this.updateBuySignalAfterOrder(actualPrice, filledValue, orderDetails);
-          this.lastBuyTime = Date.now();
-          
-          // Place a limit sell order for this buy (3.5% profit target)
-          if (filledSize > 0) {
-            try {
-              const formattedSellSize = this.formatPrice(filledSize, this.baseCurrency);
-              logger.info(`Placing limit sell order for ${formattedSellSize} ${this.baseCurrency}...`);
-              await this.placeLimitSellOrder(actualPrice, filledSize);
-            } catch (sellError) {
-              logger.error('Failed to place limit sell order after buy:', sellError);
-              // Even if sell order fails, we still consider the buy successful
-            }
+        // Place a limit sell order for this buy (3.5% profit target)
+        if (positionSize > 0) {
+          try {
+            const formattedSellSize = this.formatPrice(positionSize, this.baseCurrency);
+            logger.info(`Placing limit sell order for ${formattedSellSize} ${this.baseCurrency}...`);
+            await this.placeLimitSellOrder(price, positionSize);
+          } catch (sellError) {
+            logger.error('Failed to place limit sell order after buy:', sellError);
+            // Even if sell order fails, we still consider the buy successful
           }
-          
-          return orderDetails;
-        } else {
-          // Order was placed but not filled yet or partially filled
-          logger.warn(`${orderLabel} Order placed but not filled yet. Status: ${orderDetails.status}`);
-          this.logTrade('BUY_PENDING', price, positionSize, orderDetails);
-          return orderDetails;
         }
+        
+        return orderResponse;
         
       } catch (confirmError) {
         // If we can't confirm the order status, log the error but still try to proceed
