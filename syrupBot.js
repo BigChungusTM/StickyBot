@@ -360,14 +360,31 @@ class SyrupTradingBot {
       positionSizePercent: 20, // Percentage of available balance to use per buy
       maxDollarCostAveraging: 3, // Maximum number of times to DCA into a position
       profitTargetPercent: 4.0,  // 4% profit target for limit sells
-      // 24h low scoring configuration - points based on % above 24h low
+      // 24h low scoring configuration - points based on % above/below 24h average low
+      // Scores range from 0-10 with 0.5% increments from -5% to +5%
       low24hScoreRanges: [
-        { maxPercent: 1.0, score: 10 },   // 0-1% above 24h low: 10 points
-        { maxPercent: 2.0, score: 8 },    // 1-2% above 24h low: 8 points
-        { maxPercent: 3.0, score: 6 },    // 2-3% above 24h low: 6 points
-        { maxPercent: 4.0, score: 4 },    // 3-4% above 24h low: 4 points
-        { maxPercent: 5.0, score: 2 },    // 4-5% above 24h low: 2 points
-        { maxPercent: Infinity, score: 0 } // >5% above 24h low: 0 points
+        { maxPercent: -5.0, score: 10 },   // -5% or below 24h avg low: 10 points
+        { maxPercent: -4.5, score: 9.5 },  // -4.5% to -5%: 9.5 points
+        { maxPercent: -4.0, score: 9 },    // -4% to -4.5%: 9 points
+        { maxPercent: -3.5, score: 8.5 },  // -3.5% to -4%: 8.5 points
+        { maxPercent: -3.0, score: 8 },    // -3% to -3.5%: 8 points
+        { maxPercent: -2.5, score: 7.5 },  // -2.5% to -3%: 7.5 points
+        { maxPercent: -2.0, score: 7 },    // -2% to -2.5%: 7 points
+        { maxPercent: -1.5, score: 6.5 },  // -1.5% to -2%: 6.5 points
+        { maxPercent: -1.0, score: 6 },    // -1% to -1.5%: 6 points
+        { maxPercent: -0.5, score: 5.5 },  // -0.5% to -1%: 5.5 points
+        { maxPercent: 0.0, score: 5 },     // 0% to -0.5%: 5 points
+        { maxPercent: 0.5, score: 4.5 },   // 0% to 0.5%: 4.5 points
+        { maxPercent: 1.0, score: 4 },     // 0.5% to 1%: 4 points
+        { maxPercent: 1.5, score: 3.5 },   // 1% to 1.5%: 3.5 points
+        { maxPercent: 2.0, score: 3 },     // 1.5% to 2%: 3 points
+        { maxPercent: 2.5, score: 2.5 },   // 2% to 2.5%: 2.5 points
+        { maxPercent: 3.0, score: 2 },     // 2.5% to 3%: 2 points
+        { maxPercent: 3.5, score: 1.5 },   // 3% to 3.5%: 1.5 points
+        { maxPercent: 4.0, score: 1 },     // 3.5% to 4%: 1 point
+        { maxPercent: 4.5, score: 0.5 },   // 4% to 4.5%: 0.5 points
+        { maxPercent: 5.0, score: 0.1 },   // 4.5% to 5%: 0.1 points (min score)
+        { maxPercent: Infinity, score: 0 } // >5% above 24h avg low: 0 points
       ]
     };
     
@@ -1792,10 +1809,10 @@ class SyrupTradingBot {
   }
   
   /**
-   * Calculates a score based on how close the current price is to the 24-hour low
-   * Higher scores indicate the price is closer to the 24h low
+   * Calculates a score based on how close the current price is to the 24-hour average low
+   * Higher scores indicate the price is closer to the 24h average low
    * @param {number} currentPrice - The current price to evaluate
-   * @returns {Object} Score and metadata about the 24h low calculation
+   * @returns {Object} Score and metadata about the 24h average low calculation
    */
   async calculate24hLowScore(currentPrice) {
     try {
@@ -1804,7 +1821,7 @@ class SyrupTradingBot {
         throw new Error(`Invalid current price: ${currentPrice}`);
       }
       
-      let low24h = 0;
+      let avgLow24h = 0;
       let percentAbove24hLow = 0;
       
       // Ensure we have enough data
@@ -1814,7 +1831,7 @@ class SyrupTradingBot {
         const dailyCandles = (this.candles || []).slice(-1440);
         
         if (dailyCandles.length < 60) {
-          throw new Error('Insufficient data for 24h low calculation');
+          throw new Error('Insufficient data for 24h average low calculation');
         }
         
         const validDailyCandles = dailyCandles.filter(candle => 
@@ -1822,36 +1839,43 @@ class SyrupTradingBot {
         );
         
         if (validDailyCandles.length === 0) {
-          throw new Error('No valid daily candles found for 24h low calculation');
+          throw new Error('No valid daily candles found for 24h average low calculation');
         }
         
-        low24h = Math.min(...validDailyCandles.map(candle => candle.low));
+        // Calculate average of all daily lows as fallback
+        const sum = validDailyCandles.reduce((sum, candle) => sum + candle.low, 0);
+        avgLow24h = sum / validDailyCandles.length;
       } else {
-        // Use hourly candles for more accurate 24h low calculation
-        const validHourlyCandles = this.hourlyCandles.filter(candle => 
-          candle && typeof candle.low === 'number' && !isNaN(candle.low) && candle.low > 0
-        );
+        // Use hourly candles for 24h average low calculation
+        const validHourlyCandles = this.hourlyCandles
+          .slice(-24) // Only use the last 24 hours
+          .filter(candle => 
+            candle && typeof candle.low === 'number' && !isNaN(candle.low) && candle.low > 0
+          );
         
         if (validHourlyCandles.length === 0) {
-          throw new Error('No valid hourly candles found for 24h low calculation');
+          throw new Error('No valid hourly candles found for 24h average low calculation');
         }
         
-        low24h = Math.min(...validHourlyCandles.map(candle => candle.low));
+        // Calculate the average of the last 24 hourly lows
+        const sum = validHourlyCandles.reduce((sum, candle) => sum + candle.low, 0);
+        avgLow24h = sum / validHourlyCandles.length;
       }
       
-      // Ensure we have a valid low24h before proceeding
-      if (typeof low24h !== 'number' || isNaN(low24h) || low24h <= 0) {
-        throw new Error(`Invalid 24h low value: ${low24h}`);
+      // Ensure we have a valid avgLow24h before proceeding
+      if (typeof avgLow24h !== 'number' || isNaN(avgLow24h) || avgLow24h <= 0) {
+        throw new Error(`Invalid 24h average low value: ${avgLow24h}`);
       }
       
-      percentAbove24hLow = ((currentPrice - low24h) / low24h) * 100;
+      // Calculate percentage above the 24h average low
+      percentAbove24hLow = ((currentPrice - avgLow24h) / avgLow24h) * 100;
       
       // Ensure we have a valid percentage
       if (isNaN(percentAbove24hLow) || !isFinite(percentAbove24hLow)) {
-        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, low24h=${low24h}`);
+        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, avgLow24h=${avgLow24h}`);
       }
       
-      return this.calculate24hLowScoreFromValues(low24h, currentPrice, percentAbove24hLow);
+      return this.calculate24hLowScoreFromValues(avgLow24h, currentPrice, percentAbove24hLow);
       
     } catch (error) {
       logger.error(`Error in calculate24hLowScore: ${error.message}`, { currentPrice });
@@ -2110,6 +2134,20 @@ class SyrupTradingBot {
     // Check if we have an active buy signal that needs to be monitored
     if (this.activeBuySignal.isActive) {
       const priceIncreasePct = ((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice) * 100;
+      
+      // Log the current active signal state
+      logger.debug('Active buy signal state:', {
+        timestamp: currentTime.toISOString(),
+        signalPrice: this.activeBuySignal.signalPrice,
+        currentPrice,
+        priceIncreasePct: priceIncreasePct.toFixed(4) + '%',
+        confirmations: this.activeBuySignal.confirmations,
+        lastConfirmationTime: this.activeBuySignal.lastConfirmationTime ? 
+          new Date(this.activeBuySignal.lastConfirmationTime).toISOString() : null,
+        buyCount: this.activeBuySignal.buyCount,
+        totalInvested: this.activeBuySignal.totalInvested,
+        totalQuantity: this.activeBuySignal.totalQuantity
+      });
       
       // If price increased by 0.5% or more, cancel the buy signal
       if (priceIncreasePct >= 0.5) {
@@ -2649,32 +2687,81 @@ class SyrupTradingBot {
    */
   async checkAndExecuteTrades() {
     try {
-      if (!this.candles || this.candles.length === 0) {
-        logger.warn('No candle data available');
-        return;
-      }
+    // Refresh account balances before checking conditions
+    await this.getAccountBalances();
+    
+    if (!this.candles || this.candles.length === 0) {
+      logger.warn('No candle data available');
+      return;
+    }
+    
+    // Get the latest candle
+    const latestCandle = this.candles[this.candles.length - 1];
+    const currentPrice = parseFloat(latestCandle.close);
+    
+    // Get fresh quote balance
+    const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
+    const minPositionSize = parseFloat(this.buyConfig.minPositionSize);
+    
+    logger.debug('Balance check:', {
+      quoteBalance,
+      minPositionSize,
+      hasEnoughBalance: quoteBalance >= minPositionSize,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Check if we have enough funds to trade
+    if (quoteBalance < minPositionSize) {
+      logger.warn(`Insufficient ${this.quoteCurrency} balance to trade. Available: ${quoteBalance} ${this.quoteCurrency}, Required: ${minPositionSize} ${this.quoteCurrency}`);
+      return;
+    }
       
-      // Get the latest candle
-      const latestCandle = this.candles[this.candles.length - 1];
-      const currentPrice = parseFloat(latestCandle.close);
-      
-      // Check if we have enough funds to trade
-      const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
-      if (quoteBalance < this.buyConfig.minPositionSize) {
-        logger.warn(`Insufficient ${this.quoteCurrency} balance to trade`);
-        return;
+      // Reset active buy signal if we have no position and signal is stale
+      if (this.activeBuySignal.isActive && 
+          Date.now() - this.activeBuySignal.lastConfirmationTime > 3600000) { // 1 hour
+        logger.info('Resetting stale buy signal');
+        this.resetBuySignal();
       }
       
       // Calculate indicators
       this.calculateIndicators();
       
-      // Evaluate buy signal (simplified)
+      // Evaluate buy signal
       const signal = await this.evaluateBuySignal(this.indicators);
+      
+      // Log signal evaluation details
+      logger.debug('Signal evaluation result:', {
+        timestamp: new Date().toISOString(),
+        hasSignal: !!signal,
+        signalScore: signal?.score,
+        minRequiredScore: this.buyConfig.minScore,
+        meetsScoreThreshold: signal?.score >= this.buyConfig.minScore,
+        activeBuySignal: this.activeBuySignal.isActive ? {
+          isActive: true,
+          confirmations: this.activeBuySignal.confirmations,
+          lastConfirmationTime: new Date(this.activeBuySignal.lastConfirmationTime).toISOString(),
+          buyCount: this.activeBuySignal.buyCount
+        } : { isActive: false },
+        pendingSignalsCount: this.pendingBuySignals.length,
+        quoteBalance: quoteBalance,
+        minPositionSize: this.buyConfig.minPositionSize,
+        hasSufficientFunds: quoteBalance >= this.buyConfig.minPositionSize
+      });
       
       if (signal && signal.score >= this.buyConfig.minScore) {
         logger.info(`Buy signal detected with score ${signal.score}/${this.buyConfig.minScore}`);
+        
         // Place buy order with the current price
-        await this.placeBuyOrder(currentPrice, 'AUTO');
+        try {
+          await this.placeBuyOrder(currentPrice, 'AUTO');
+        } catch (error) {
+          logger.error('Error placing buy order:', {
+            error: error.message,
+            stack: error.stack,
+            price: currentPrice,
+            timestamp: new Date().toISOString()
+          });
+        }
       }
       
     } catch (error) {
@@ -2695,8 +2782,16 @@ class SyrupTradingBot {
         return null;
       }
 
-      // Subtract 0.1 SYRUP to account for any rounding errors and ensure the order goes through
-      const adjustedAmount = Math.max(0.1, amount - 0.1); // Ensure we don't go below 0.1
+      // Format the trading pair (e.g., 'SYRUP-USDC')
+      const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
+      
+      // Calculate sell price with 4% profit target
+      const sellPrice = parseFloat((buyPrice * 1.04).toFixed(4));
+      
+      // Format amount to 1 decimal place for SYRUP
+      const formattedAmount = parseFloat(amount.toFixed(1));
+      
+      logger.info(`Placing limit sell order for ${formattedAmount} ${this.baseCurrency}...`);
       
       logger.info(`Limit sell order details - ` +
         `Trading Pair: ${formattedTradingPair}, ` +
@@ -2724,17 +2819,20 @@ class SyrupTradingBot {
       const orderId = orderResponse?.order_id || orderResponse?.success_response?.order_id;
       
       if (orderId) {
-        logger.info(`Limit sell order placed successfully. ID: ${orderId}`);
-        
-        // Log the sell order details
-        const tradeResponse = orderResponse.success_response || orderResponse;
-        this.logTrade('SELL_LIMIT', sellPrice, amount * sellPrice, {
-          ...tradeResponse,
-          filled_size: formattedAmount,
-          executed_value: (amount * sellPrice).toFixed(8)
-        });
-        
-        return tradeResponse;
+      logger.info(`Limit sell order placed successfully. ID: ${orderId}`);
+      
+      // Log the sell order details
+      const tradeResponse = orderResponse.success_response || orderResponse;
+      this.logTrade('SELL_LIMIT', sellPrice, amount * sellPrice, {
+        ...tradeResponse,
+        filled_size: formattedAmount,
+        executed_value: (amount * sellPrice).toFixed(8)
+      });
+      
+      // Reset the buy signal after a successful sell
+      this.resetBuySignal('sell order executed');
+      
+      return tradeResponse;
       } else {
         logger.error('Unexpected order response format:', JSON.stringify(orderResponse, null, 2));
         throw new Error('Invalid response format when placing limit sell order');
@@ -2763,25 +2861,52 @@ class SyrupTradingBot {
       const timeSinceLastBuy = Date.now() - this.lastBuyTime;
       if (timeSinceLastBuy < this.buyCooldown) {
         const remainingMs = this.buyCooldown - timeSinceLastBuy;
-        logger.warn(`${orderLabel} Cooldown active. ${Math.ceil(remainingMs/1000)}s remaining.`);
+        const remainingSec = Math.ceil(remainingMs / 1000);
+        logger.warn(`${orderLabel} Cooldown active. ${remainingSec}s remaining.`);
+        
+        // Log this as a skipped trade due to cooldown
+        this.logTrade('BUY_SKIPPED', price, 0, {
+          reason: `Cooldown active (${remainingSec}s remaining)`,
+          lastBuyTime: new Date(this.lastBuyTime).toISOString(),
+          cooldownMs: this.buyCooldown,
+          timestamp: new Date().toISOString()
+        });
+        
         return null;
       }
       
       // 2. Check account balance and calculate position size
       await this.getAccountBalances();
       const quoteBalance = parseFloat(this.accounts[this.quoteCurrency]?.available || 0);
+      const minPositionSize = parseFloat(this.buyConfig.minPositionSize);
+      
+      // Log detailed balance information
+      logger.debug('Buy order balance check:', {
+        availableBalance: quoteBalance,
+        minPositionSize: minPositionSize,
+        hasEnoughBalance: quoteBalance >= minPositionSize,
+        timestamp: new Date().toISOString()
+      });
       
       // 2.1 Check if we have enough balance for minimum trade size
-      if (quoteBalance < this.buyConfig.minPositionSize) {
-        logger.warn(`${orderLabel} Insufficient ${this.quoteCurrency} balance. ` +
-                   `Available: ${this.formatPrice(quoteBalance, this.quoteCurrency)} ${this.quoteCurrency}, ` +
-                   `Minimum required: ${this.formatPrice(this.buyConfig.minPositionSize, this.quoteCurrency)} ${this.quoteCurrency}`);
+      if (quoteBalance < minPositionSize) {
+        const warningMsg = `${orderLabel} Insufficient ${this.quoteCurrency} balance. ` +
+                        `Available: ${this.formatPrice(quoteBalance, this.quoteCurrency)} ${this.quoteCurrency}, ` +
+                        `Minimum required: ${this.formatPrice(minPositionSize, this.quoteCurrency)} ${this.quoteCurrency}`;
+        
+        logger.warn(warningMsg);
+        
+        // If we have an active buy signal but not enough balance, reset it
+        if (this.activeBuySignal.isActive) {
+          logger.info(`${orderLabel} Resetting active buy signal due to insufficient funds`);
+          this.resetBuySignal();
+        }
         
         // Log this as a skipped trade due to insufficient funds
         this.logTrade('BUY_SKIPPED', price, 0, {
           reason: `Insufficient ${this.quoteCurrency} balance`,
           available: quoteBalance,
-          required: this.buyConfig.minPositionSize,
+          required: minPositionSize,
           timestamp: new Date().toISOString()
         });
         
@@ -2950,12 +3075,35 @@ class SyrupTradingBot {
    */
   updateBuySignalAfterOrder(price, amount, orderResponse) {
     try {
-      const orderId = orderResponse?.order_id || `manual-${Date.now()}`;
-      const filledSize = parseFloat(orderResponse?.filled_size || (amount / price));
-      const filledValue = parseFloat(orderResponse?.executed_value || amount);
+      // Extract order ID from the response
+      const orderId = orderResponse?.order_id || orderResponse?.success_response?.order_id || `manual-${Date.now()}`;
+      
+      // For market orders, we might not have filled_size in the immediate response
+      // So we'll use the amount and price passed to the function
+      let filledSize = 0;
+      let filledValue = 0;
+      
+      if (orderResponse?.success_response?.filled_size) {
+        filledSize = parseFloat(orderResponse.success_response.filled_size);
+      } else if (orderResponse?.filled_size) {
+        filledSize = parseFloat(orderResponse.filled_size);
+      } else {
+        // Fallback to calculating from amount and price
+        filledSize = amount / price;
+      }
+      
+      if (orderResponse?.success_response?.executed_value) {
+        filledValue = parseFloat(orderResponse.success_response.executed_value);
+      } else if (orderResponse?.executed_value) {
+        filledValue = parseFloat(orderResponse.executed_value);
+      } else {
+        // Fallback to using the amount passed to the function
+        filledValue = amount;
+      }
       
       // Skip if this is a sell order
-      if (orderResponse?.side === 'SELL' || orderResponse?.side === 'SELL_LIMIT') {
+      const orderSide = orderResponse?.side || (orderResponse?.success_response?.side || '').toUpperCase();
+      if (orderSide === 'SELL' || orderSide === 'SELL_LIMIT') {
         return;
       }
       
@@ -2989,36 +3137,115 @@ class SyrupTradingBot {
         this.activeBuySignal.lastConfirmationTime = Date.now();
       }
       
-      logger.info(`Buy order executed. Position: ${this.activeBuySignal.totalQuantity.toFixed(8)} ${this.baseCurrency} ` +
-                 `@ avg price ${this.activeBuySignal.averagePrice.toFixed(8)} ${this.quoteCurrency} ` +
+      // Log the updated position
+      logger.info(`Buy order executed. Position: ${this.activeBuySignal.totalQuantity.toFixed(2)} ${this.baseCurrency} ` +
+                 `@ avg price ${this.activeBuySignal.averagePrice.toFixed(4)} ${this.quoteCurrency} ` +
                  `(Total: ${this.activeBuySignal.totalInvested.toFixed(2)} ${this.quoteCurrency})`);
+      
+      // Clear pending signals after a successful buy to allow new signals
+      const pendingCount = this.pendingBuySignals.length;
+      this.pendingBuySignals = [];
+      if (pendingCount > 0) {
+        logger.info(`Cleared ${pendingCount} pending buy signals after successful buy order`);
+      }
     } catch (error) {
-      logger.error('Error updating buy signal after order:', error);
+      logger.error('Error updating buy signal after order:', error, {
+        orderResponse: JSON.stringify(orderResponse, null, 2),
+        errorMessage: error.message,
+        stack: error.stack
+      });
     }
   }
 
-  resetBuySignal() {
+  /**
+   * Log trade details
+   * @param {string} type - Type of trade (e.g., 'BUY', 'SELL_LIMIT', 'BUY_FAILED')
+   * @param {number} price - Price of the trade
+   * @param {number} amount - Amount in quote currency
+   * @param {Object} [metadata] - Additional trade metadata
+   */
+  logTrade(type, price, amount, metadata = {}) {
+    try {
+      const timestamp = new Date().toISOString();
+      const logEntry = {
+        timestamp,
+        type,
+        pair: this.tradingPair,
+        price: parseFloat(price) || 0,
+        amount: parseFloat(amount) || 0,
+        ...metadata
+      };
+      
+      // Log to console
+      console.log(`[${timestamp}] ${type} ${this.tradingPair} @ ${price} - Amount: ${amount} ${this.quoteCurrency}`);
+      
+      // Log to file if needed
+      logger.info('TRADE_EXECUTED', logEntry);
+      
+      return logEntry;
+    } catch (error) {
+      logger.error('Error in logTrade:', error);
+      console.error('Error logging trade:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Reset the active buy signal and clean up related state
+   * @param {string} reason - Reason for the reset (for logging)
+   * @returns {boolean} Whether there was an active signal that was reset
+   */
+  resetBuySignal(reason = 'manual reset') {
+    const wasActive = this.activeBuySignal.isActive;
+    const signalId = this.activeBuySignal.signalId;
+    
+    // Log the reset with details about the previous state
+    logger.info('Resetting buy signal state', {
+      reason: reason,
+      wasActive: wasActive,
+      signalId: signalId,
+      signalPrice: this.activeBuySignal.signalPrice,
+      confirmations: this.activeBuySignal.confirmations,
+      buyCount: this.activeBuySignal.buyCount,
+      totalInvested: this.activeBuySignal.totalInvested,
+      totalQuantity: this.activeBuySignal.totalQuantity,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Reset the active buy signal
     this.activeBuySignal = {
       isActive: false,
       signalPrice: null,
       signalTime: null,
       confirmations: 0,
       lastConfirmationTime: null,
+      orderIds: [],
+      buyCount: 0,
       totalInvested: 0,
       totalQuantity: 0,
       averagePrice: 0,
-      buyCount: 0,
       lastBuyPrice: 0,
-      orderIds: []
+      initialScore: 0,
+      signalId: null
     };
-  }
-
-  logTrade(side, price, amount, orderResponse) {
-    try {
-      // ... existing code ...
-    } catch (error) {
-      logger.error('Error logging trade:', error);
+    
+    // Also clear any pending signals that might be related
+    const pendingCount = this.pendingBuySignals.length;
+    this.pendingBuySignals = [];
+    this.lastBuyScore = 0;
+    
+    if (pendingCount > 0) {
+      logger.info(`Cleared ${pendingCount} pending buy signals during reset`);
     }
+    
+    // Log the reset completion
+    logger.debug('Buy signal state reset complete', {
+      activeBuySignal: this.activeBuySignal,
+      pendingSignalsCount: this.pendingBuySignals.length,
+      timestamp: new Date().toISOString()
+    });
+    
+    return wasActive;
   }
 
   getMsToNextMinute() {
