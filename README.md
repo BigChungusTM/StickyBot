@@ -1,23 +1,40 @@
-# SyrupBot Trading System
+# 🍯 SyrupBot Trading System
 
 **Note:** This is a high-frequency trading bot specifically designed for the SYRUP-USDC trading pair on Coinbase Advanced Trade. The bot uses a sophisticated 21-point scoring system with 2-candle confirmation to identify high-probability trading opportunities.
+
+## 🆕 Recent Updates
+- **2024-06-13**: Enhanced Telegram integration with improved error handling and logging
+- **2024-06-13**: Fixed chat ID handling for Telegram notifications
+- **2024-06-13**: Added comprehensive function documentation in `common_functions.md`
+- **2024-06-13**: Improved error handling for order placement and execution
+- **2024-06-12**: Updated sell profit target to 4% (from 3.5%)
 
 ## Overview
 SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRUP-USDC trading pair. The bot uses a sophisticated scoring system combining technical indicators, dip detection, and 24-hour low proximity to identify high-probability trading opportunities. It executes trades through the Coinbase Advanced Trade API.
 
-## Key Features
-- Real-time 1-minute candle data collection and caching (60-minute rolling window)
-- 24-hour hourly candle tracking for accurate 24h low calculation
-- Comprehensive technical analysis (RSI, MACD, Bollinger Bands, Stochastics, EMA)
-- Advanced 21-point scoring system (8 tech + 3 dip + 10 24h low)
-- 2-candle confirmation system with price-based decay
-- 24-hour low proximity scoring for optimal entry timing
-- Automatic position management with DCA support (max 3 attempts)
-- Limit sell orders with 3.5% profit target (GTC orders)
-- Manual trade detection and position synchronization
-- Persistent position tracking across restarts
-- Detailed logging and trade history
-- Precise system clock-aligned trading cycles (minute + 500ms)
+## ✨ Key Features
+- **Real-time Data**
+  - 1-minute candle data collection and caching (60-minute rolling window)
+  - 24-hour hourly candle tracking for accurate 24h low calculation
+  - Precise system clock-aligned trading cycles (minute + 500ms)
+
+- **Technical Analysis**
+  - Comprehensive indicators (RSI, MACD, Bollinger Bands, Stochastics, EMA)
+  - Advanced 21-point scoring system (8 tech + 3 dip + 10 24h low)
+  - 2-candle confirmation system with price-based decay
+  - 24-hour low proximity scoring for optimal entry timing
+
+- **Trading Features**
+  - Automatic position management with DCA support (max 3 attempts)
+  - Limit sell orders with 4% profit target (GTC orders)
+  - Manual trade detection and position synchronization
+  - Persistent position tracking across restarts
+
+- **Monitoring & Alerts**
+  - Real-time Telegram notifications for trades and errors
+  - Detailed logging and trade history
+  - System status monitoring and alerts
+  - Public-safe command interface via Telegram
 
 ## Installation
 
@@ -62,11 +79,16 @@ SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRU
    ./start.sh
    ```
 
-## Core Components
+## 📚 Documentation
+
+For detailed documentation of all functions and their usage, see [COMMON_FUNCTIONS.md](common_functions.md).
+
+## 🏗️ Core Components
 
 ### 1. Candle Management
 - `fetchInitialCandles()`: Fetches the initial set of 60 candles (1 hour of 1-minute candles)
 - `fetchCandleData()`: Fetches new candle data on each cycle
+- `updateHourlyCandles()`: Maintains 24-hour candle history for low calculations
 - `backfillMissingCandles()`: Handles missing or incomplete candle data
 - `saveCandlesToCache()`: Persists candle data to disk
 
@@ -85,16 +107,38 @@ SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRU
 
 ### 3. Order Execution
 - `placeBuyOrder()`: Executes market buy orders
-- `placeLimitSellOrder()`: Places limit sell orders with 3.5% profit target
+- `placeLimitSellOrder()`: Places limit sell orders with 4% profit target
 - `updateBuySignalAfterOrder()`: Updates position tracking after successful orders
 - `checkForManualBuys()`: Detects and accounts for manual trades
 
 ### 4. Trading Cycle
 - `startTradingCycle()`: Main trading loop
+- `tradingLoop()`: Core trading logic and timing
 - `checkAndExecuteTrades()`: Evaluates market conditions and executes trades
 - `logTradeCycle()`: Logs current market state and trading decisions
+- `waitForNextMinute()`: Ensures precise timing of trading cycles
 
-## Configuration
+## 🔧 Configuration
+
+### Environment Variables
+Create a `.env` file with the following variables:
+```
+# Coinbase API Configuration
+COINBASE_API_KEY_ID=your_api_key_id
+COINBASE_API_SECRET=your_api_secret
+COINBASE_API_NICKNAME=your_nickname
+
+# Trading Configuration
+TRADING_PAIR=SYRUP-USDC
+BASE_CURRENCY=SYRUP
+QUOTE_CURRENCY=USDC
+
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+TELEGRAM_ADMIN_USERNAME=your_telegram_username
+TELEGRAM_NOTIFICATIONS_ENABLED=true
+```
 
 ### Buy Signal Configuration
 ```javascript
