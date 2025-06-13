@@ -155,7 +155,9 @@ const formatTimestamp = (timestamp) => {
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = path.dirname(scriptPath);
 const CACHE_FILE = path.join(scriptDir, 'candle_cache.json');
+const HOURLY_CACHE_FILE = path.join(scriptDir, 'hourly_candle_cache.json');
 const MAX_CANDLES = 10080; // 1 week of 1-minute candles (60*24*7)
+const MAX_HOURLY_CANDLES = 24; // 24 hours of hourly candles
 
 // Load environment variables
 dotenv.config();
@@ -433,9 +435,6 @@ class SyrupTradingBot {
       return false;
     }
     
-    // Initialize hourly candles
-    await this.updateHourlyCandles();
-
     this._isInitializing = true;
     
     try {
@@ -470,9 +469,27 @@ class SyrupTradingBot {
       }
       
       // Load hourly candles before starting the trading cycle
-      logger.info('Fetching initial hourly candle data...');
+      logger.info('Loading hourly candle data...');
       try {
-        await this.updateHourlyCandles(true); // Force update during initialization
+        // First try to load from cache
+        this.hourlyCandles = await this.loadHourlyCandlesFromCache();
+        
+        // If no cached data or it's too old, fetch fresh data
+        const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+        const lastCandleTime = this.hourlyCandles.length > 0 
+          ? this.hourlyCandles[this.hourlyCandles.length - 1].time 
+          : 0;
+          
+        if (this.hourlyCandles.length === 0 || lastCandleTime < oneHourAgo) {
+          logger.info('Fetching fresh hourly candle data...');
+          await this.updateHourlyCandles(true);
+          
+          // Update last update time
+          this.lastHourlyCandleUpdate = Math.floor(Date.now() / 1000);
+        } else {
+          logger.info(`Using ${this.hourlyCandles.length} cached hourly candles`);
+        }
+        
         if (this.hourlyCandles.length === 0) {
           logger.warn('No hourly candles available, 24h low calculation will be less accurate');
         } else {
@@ -495,7 +512,7 @@ class SyrupTradingBot {
   
   async loadCachedCandles() {
     try {
-      const data = await fs.readFile(config.cacheFile, 'utf8');
+      const data = await fs.readFile(CACHE_FILE, 'utf8');
       const parsed = JSON.parse(data);
       
       // Validate and parse cached candles
@@ -522,28 +539,82 @@ class SyrupTradingBot {
           )
           .slice(-60); // Only keep the last 60 candles (60 minutes)
         
-        logger.info(`Loaded ${uniqueCandles.length} valid candles from cache (${invalidCandles} invalid, limited to last 60 candles)`);
+        logger.info(`Loaded ${uniqueCandles.length} valid 1m candles from cache (${invalidCandles} invalid, limited to last 60 candles)`);
         return uniqueCandles;
       }
     } catch (error) {
       if (error.code !== 'ENOENT') {
-        logger.warn('Error reading cache file:', error);
+        logger.warn('Error reading 1m cache file:', error);
       } else {
-        logger.info('No cache file found, will create a new one');
+        logger.info('No 1m cache file found, will create a new one');
       }
     }
     return [];
   }
 
+  /**
+   * Loads hourly candles from the cache file
+   * @returns {Promise<Array>} Array of processed hourly candles
+   */
+  async loadHourlyCandlesFromCache() {
+    try {
+      // Ensure cache directory exists
+      try {
+        await fs.access(HOURLY_CACHE_FILE);
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          logger.info('No hourly cache file found, will create a new one');
+          return [];
+        }
+        throw error;
+      }
+      
+      const data = await fs.readFile(HOURLY_CACHE_FILE, 'utf8');
+      const parsed = JSON.parse(data);
+      
+      // Validate and parse cached hourly candles
+      if (parsed && Array.isArray(parsed.candles)) {
+        const candles = [];
+        let validCandles = 0;
+        let invalidCandles = 0;
+        
+        for (const candle of parsed.candles) {
+          const processed = processCandle(candle);
+          if (processed) {
+            candles.push(processed);
+            validCandles++;
+          } else {
+            invalidCandles++;
+          }
+        }
+        
+        // Sort by time (oldest first), remove duplicates, and limit to last 24 candles
+        const uniqueCandles = candles
+          .sort((a, b) => a.time - b.time)
+          .filter((candle, index, array) => 
+            index === 0 || candle.time !== array[index - 1].time
+          )
+          .slice(-MAX_HOURLY_CANDLES);
+        
+        logger.info(`Loaded ${uniqueCandles.length} valid hourly candles from cache (${invalidCandles} invalid, limited to last ${MAX_HOURLY_CANDLES} candles)`);
+        return uniqueCandles;
+      }
+      return [];
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        logger.error('Error reading hourly cache file:', error);
+      }
+      return [];
+    }
+  }
+
   async saveCandlesToCache() {
     if (!this.candles || this.candles.length === 0) {
-      logger.warn('No candles to save to cache');
+      logger.warn('No 1m candles to save to cache');
       return;
     }
     
     try {
-      const cachePath = path.join(scriptDir, 'candle_cache.json');
-      
       // Create a clean copy of candles with just the data we want to save
       // Take only the most recent 60 candles
       const recentCandles = this.candles.slice(-60);
@@ -568,29 +639,102 @@ class SyrupTradingBot {
       };
       
       // Write to a temporary file first, then rename to avoid corruption
-      const tempPath = `${cachePath}.tmp`;
+      const tempPath = `${CACHE_FILE}.tmp`;
       await fs.writeFile(tempPath, JSON.stringify(cacheData, null, 2));
       
       // On Windows, we need to remove the destination file first if it exists
       try {
-        await fs.unlink(cachePath);
+        await fs.unlink(CACHE_FILE);
       } catch (e) {
         // Ignore if file doesn't exist
         if (e.code !== 'ENOENT') throw e;
       }
       
       // Rename temp file to final name
-      await fs.rename(tempPath, cachePath);
+      await fs.rename(tempPath, CACHE_FILE);
       
-      logger.info(`Saved ${candlesToSave.length} candles to cache (${cachePath})`);
+      logger.info(`Saved ${candlesToSave.length} 1m candles to cache`);
       
     } catch (error) {
-      logger.error('Error saving candles to cache:', error);
+      logger.error('Error saving 1m candles to cache:', error);
       // Don't throw, as this isn't a critical error
-      logger.warn('Continuing without saving to cache');
+      logger.warn('Continuing without saving to 1m cache');
     }
   }
 
+  /**
+   * Saves hourly candles to cache file
+   */
+  async saveHourlyCandlesToCache() {
+    if (!this.hourlyCandles || this.hourlyCandles.length === 0) {
+      logger.warn('No hourly candles to save to cache');
+      return;
+    }
+    
+    let tempPath = '';
+    try {
+      // Create a clean copy of hourly candles with just the data we want to save
+      // Take only the most recent 24 candles
+      const recentCandles = this.hourlyCandles.slice(-MAX_HOURLY_CANDLES);
+      const candlesToSave = recentCandles.map(candle => ({
+        time: candle.time,  // Already in Unix seconds
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume
+      }));
+      
+      const cacheData = {
+        candles: candlesToSave,
+        timestamp: Math.floor(Date.now() / 1000), // Save current time in Unix seconds
+        metadata: {
+          tradingPair: this.tradingPair,
+          granularity: '1h',
+          count: candlesToSave.length,
+          firstCandle: candlesToSave.length > 0 ? formatTimestamp(candlesToSave[0].time) : null,
+          lastCandle: candlesToSave.length > 0 ? formatTimestamp(candlesToSave[candlesToSave.length - 1].time) : null
+        }
+      };
+      
+      // Write to a temporary file first, then rename to avoid corruption
+      tempPath = `${HOURLY_CACHE_FILE}.tmp`;
+      await fs.writeFile(tempPath, JSON.stringify(cacheData, null, 2));
+      
+      // On Windows, we need to remove the destination file first if it exists
+      try {
+        await fs.access(HOURLY_CACHE_FILE);
+        await fs.unlink(HOURLY_CACHE_FILE);
+      } catch (e) {
+        // Ignore if file doesn't exist
+        if (e.code !== 'ENOENT') throw e;
+      }
+      
+      // Rename temp file to final name
+      await fs.rename(tempPath, HOURLY_CACHE_FILE);
+      
+      logger.info(`Saved ${candlesToSave.length} hourly candles to cache`);
+    } catch (error) {
+      logger.error('Error saving hourly candles to cache:', error);
+      // Don't throw, as this isn't a critical error
+      logger.warn('Continuing without saving to hourly cache');
+      
+      // Clean up temp file if it exists
+      if (tempPath) {
+        try {
+          await fs.unlink(tempPath);
+        } catch (e) {
+          // Ignore errors in cleanup
+        }
+      }
+    }
+  }
+
+  /**
+   * Fetches initial candle data from the API and processes it
+   * @returns {Promise<Array>} Array of processed candles
+   * @throws {Error} If no candles are returned or if there's an error processing them
+   */
   async fetchInitialCandles() {
     try {
       logger.info('Fetching initial candle data...');
@@ -1448,7 +1592,7 @@ class SyrupTradingBot {
     
     // If we have recent data and not forced, skip update
     const hasRecentData = this.hourlyCandles.length > 0 && 
-                         now - this.lastHourlyCandleUpdate < 3600000; // 1 hour in ms
+                         now - this.lastHourlyCandleUpdate < 300000; // 5 minutes in ms
     
     if (!force && hasRecentData) {
       logger.debug('Skipping hourly candle update - data is recent');
@@ -1463,47 +1607,196 @@ class SyrupTradingBot {
     
     this._isUpdatingHourlyCandles = true;
     
-    // Clear existing candles when forcing an update
-    if (force) {
-      this.hourlyCandles = [];
-    }
-
     try {
-      logger.info('Updating hourly candle data for 24h low calculation...');
+      logger.info('Updating hourly candles...');
       
-      // Fetch hourly candles (24 hours worth)
-      const response = await this.client.getPublicProductCandles({
-        product_id: this.tradingPair,
-        granularity: 'ONE_HOUR', // Use string enum value for hourly candles
-        limit: 24 // We only need the last 24 hours
-      });
-
-      if (response?.candles?.length > 0) {
-        // Process and store the hourly candles
-        this.hourlyCandles = response.candles
-          .map(candle => ({
-            time: Math.floor(new Date(candle.start).getTime() / 1000),
-            open: parseFloat(candle.open),
-            high: parseFloat(candle.high),
-            low: parseFloat(candle.low),
-            close: parseFloat(candle.close),
-            volume: parseFloat(candle.volume || 0)
-          }))
-          .sort((a, b) => a.time - b.time);
-        
-        this.lastHourlyCandleUpdate = now;
-        logger.info(`Updated hourly candles, now have ${this.hourlyCandles.length} hours of data`);
+      // If we don't have any hourly candles yet, fetch the initial set
+      if (this.hourlyCandles.length === 0) {
+        this.hourlyCandles = await this.fetchInitialHourlyCandles();
       }
+      
+      // Get the timestamp of the most recent candle
+      const lastCandleTime = this.hourlyCandles.length > 0 
+        ? this.hourlyCandles[this.hourlyCandles.length - 1].start 
+        : 0;
+      
+      // Calculate the start time for fetching new candles (1 hour after the last candle)
+      const startTime = lastCandleTime > 0 ? lastCandleTime + 3600 : Math.floor(Date.now() / 1000) - 3600;
+      const endTime = Math.floor(Date.now() / 1000);
+      
+      // Only fetch if we need to (startTime is before current time)
+      if (startTime < endTime) {
+        logger.debug(`Fetching new hourly candles from ${new Date(startTime * 1000).toISOString()} to ${new Date(endTime * 1000).toISOString()}`);
+        
+        // Fetch new hourly candles (3600 seconds = 1 hour)
+        const response = await coinbaseService.getProductCandles(
+          this.tradingPair,
+          3600, // 1 hour in seconds
+          startTime.toString(), // Ensure we pass a string
+          endTime.toString()    // Ensure we pass a string
+        );
+        
+        if (response && response.candles && Array.isArray(response.candles) && response.candles.length > 0) {
+          // Process and validate the new candles
+          const newCandles = [];
+          const invalidCandles = [];
+          
+          for (const candle of response.candles) {
+            try {
+              const processed = processCandle(candle);
+              if (processed) {
+                // Only add candles that are newer than our last candle
+                if (processed.start > lastCandleTime) {
+                  newCandles.push(processed);
+                }
+              }
+            } catch (error) {
+              invalidCandles.push({ candle, error: error.message });
+            }
+          }
+          
+          // Log any invalid candles
+          if (invalidCandles.length > 0) {
+            logger.warn(`Skipped ${invalidCandles.length} invalid hourly candles during update`, {
+              invalidCandles: invalidCandles.map(ic => ({
+                timestamp: ic.candle?.start || 'unknown',
+                error: ic.error
+              }))
+            });
+          }
+          
+          // Add new candles to our cache
+          if (newCandles.length > 0) {
+            logger.info(`Adding ${newCandles.length} new hourly candles to cache`);
+            this.hourlyCandles = [...this.hourlyCandles, ...newCandles];
+            
+            // Keep only the most recent 24 candles (24 hours)
+            if (this.hourlyCandles.length > 24) {
+              this.hourlyCandles = this.hourlyCandles.slice(-24);
+            }
+            
+            // Save to cache
+            await this.saveHourlyCandlesToCache();
+          } else {
+            logger.debug('No new hourly candles to add');
+          }
+        } else {
+          logger.debug('No new hourly candles returned from API');
+        }
+      } else {
+        logger.debug('No need to update hourly candles - data is up to date');
+      }
+      
+      this.lastHourlyCandleUpdate = now;
+      logger.debug('Hourly candles updated successfully', {
+        totalCandles: this.hourlyCandles.length,
+        latestCandle: this.hourlyCandles[this.hourlyCandles.length - 1]?.start 
+          ? new Date(this.hourlyCandles[this.hourlyCandles.length - 1].start * 1000).toISOString() 
+          : 'none'
+      });
+      
     } catch (error) {
       logger.error('Error updating hourly candles:', error);
-      // Don't throw, we'll try again next time
+      // Don't throw the error, just log it
     } finally {
       this._isUpdatingHourlyCandles = false;
     }
   }
 
-  // Calculate 24h low proximity score (0-10 points)
-  // Higher scores are given when price is closer to the 24h low
+  /**
+   * Fetches the initial set of hourly candles (30 hours worth) and keeps the most recent 24 hours
+   * @returns {Promise<Array>} Array of processed hourly candles
+   */
+  async fetchInitialHourlyCandles() {
+    try {
+      logger.info('Fetching initial hourly candle data...');
+      
+      // Calculate time range: from 30 hours ago to now
+      const endTime = Math.floor(Date.now() / 1000);
+      const startTime = endTime - (30 * 60 * 60); // 30 hours ago
+      
+      logger.debug(`Fetching hourly candles from ${new Date(startTime * 1000).toISOString()} to ${new Date(endTime * 1000).toISOString()}`);
+      
+      // Fetch hourly candles (3600 seconds = 1 hour)
+      const response = await coinbaseService.getProductCandles(
+        this.tradingPair,
+        3600, // 1 hour in seconds
+        startTime.toString(), // Ensure we pass a string
+        endTime.toString()    // Ensure we pass a string
+      );
+      
+      if (!response || !response.candles || !Array.isArray(response.candles)) {
+        throw new Error('Invalid response format from getProductCandles');
+      }
+      
+      // Process and validate the candles
+      const processedCandles = [];
+      const invalidCandles = [];
+      
+      for (const candle of response.candles) {
+        try {
+          const processed = processCandle(candle);
+          if (processed) {
+            processedCandles.push(processed);
+          }
+        } catch (error) {
+          invalidCandles.push({ candle, error: error.message });
+        }
+      }
+      
+      // Log any invalid candles
+      if (invalidCandles.length > 0) {
+        logger.warn(`Skipped ${invalidCandles.length} invalid hourly candles`, {
+          invalidCandles: invalidCandles.map(ic => ({
+            timestamp: ic.candle?.start || 'unknown',
+            error: ic.error
+          }))
+        });
+      }
+      
+      // Sort candles by timestamp (oldest first)
+      processedCandles.sort((a, b) => a.start - b.start);
+      
+      // Keep only the most recent 24 candles (24 hours)
+      const recentCandles = processedCandles.slice(-24);
+      
+      // Set the hourly candles before saving to cache
+      this.hourlyCandles = recentCandles;
+      
+      logger.info(`Fetched and processed ${recentCandles.length} recent hourly candles`, {
+        totalFetched: processedCandles.length,
+        invalidCount: invalidCandles.length,
+        kept: recentCandles.length,
+        timeRange: {
+          start: recentCandles[0]?.start ? new Date(recentCandles[0].start * 1000).toISOString() : 'none',
+          end: recentCandles[recentCandles.length - 1]?.start ? 
+               new Date(recentCandles[recentCandles.length - 1].start * 1000).toISOString() : 'none'
+        }
+      });
+      
+      // Save the fetched candles to cache
+      try {
+        await this.saveHourlyCandlesToCache();
+        logger.info('Successfully saved initial hourly candles to cache');
+      } catch (cacheError) {
+        logger.error('Error saving initial hourly candles to cache:', cacheError);
+        // Don't throw, as we still want to return the candles we fetched
+      }
+      
+      return recentCandles;
+      
+    } catch (error) {
+      logger.error('Error in fetchInitialHourlyCandles:', error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Calculates a score based on how close the current price is to the 24-hour low
+   * Higher scores indicate the price is closer to the 24h low
+   * @param {number} currentPrice - The current price to evaluate
+   * @returns {Object} Score and metadata about the 24h low calculation
+   */
   async calculate24hLowScore(currentPrice) {
     try {
       // Ensure we have a valid current price
@@ -2935,8 +3228,7 @@ class SyrupTradingBot {
       // Clean up any resources if needed
     }
   }
-}
-
+} // End of SyrupTradingBot class
 
 // Format currency with symbol
 function formatCurrency(amount, currency) {
@@ -2989,3 +3281,4 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 }
 
 export default SyrupTradingBot;
+
