@@ -3,6 +3,26 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const CoinbaseApi = require('coinbase-api');
 import { coinbaseConfig } from './config.js';
+import winston from 'winston';
+
+// Configure logger
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({
+      level: 'warn', // Only show warnings and errors by default
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      )
+    })
+  ]
+});
+
 // import { v4 as uuidv4 } from 'uuid'; // No longer needed
 
 class CoinbaseService {
@@ -83,8 +103,8 @@ class CoinbaseService {
         granularityString = granularityMap[granularityValue.toString()] || 'ONE_MINUTE';
       }
       
-      // Log the request details for debugging
-      console.log(`Fetching candles for ${productId} with granularity ${granularityValue}s (${granularityString})`);
+      // Log the request details at debug level
+      logger.debug(`Fetching candles for ${productId} with granularity ${granularityValue}s (${granularityString})`);
       
       // Format dates for ISO string if needed
       let startDate = start;
@@ -101,7 +121,7 @@ class CoinbaseService {
       // Try each API method in sequence until one works
       try {
         // 1. First try Advanced Trade API
-        console.log(`Trying Advanced Trade API for ${productId}...`);
+        logger.debug(`Trying Advanced Trade API for ${productId}...`);
         
         const advancedParams = {
           product_id: productId,
@@ -111,11 +131,11 @@ class CoinbaseService {
         if (start) advancedParams.start = start;
         if (end) advancedParams.end = end;
         
-        console.log('Advanced Trade API Params:', JSON.stringify(advancedParams, null, 2));
+        logger.debug('Advanced Trade API Params:', JSON.stringify(advancedParams, null, 2));
         
         if (typeof this.client.getPublicProductCandles === 'function') {
           const advancedResponse = await this.client.getPublicProductCandles(advancedParams);
-          console.log(`Got candles using Advanced Trade API: ${JSON.stringify(advancedResponse).substring(0, 100)}...`);
+          logger.debug(`Got ${advancedResponse?.candles?.length || 0} candles from Advanced Trade API`);
           
           if (advancedResponse && advancedResponse.candles) {
             return { candles: advancedResponse.candles };

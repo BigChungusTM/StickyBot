@@ -181,14 +181,27 @@ const logger = winston.createLogger({
     winston.format.json()
   ),
   transports: [
-    // Console transport - exclude TRADE_CYCLE logs
+    // Console transport - filter out verbose logs
     new winston.transports.Console({
+      level: 'warn', // Only show warnings and errors by default
       format: winston.format.combine(
         winston.format.colorize(),
         winston.format.simple(),
         winston.format((info) => {
-          // Filter out TRADE_CYCLE logs from console
-          if (info.message === 'TRADE_CYCLE' || info.message === 'TRADE_EXECUTED') {
+          // Filter out verbose logs from console
+          const filteredMessages = [
+            'TRADE_CYCLE',
+            'TRADE_EXECUTED',
+            'Updating hourly candles',
+            'Fetching candles for',
+            'Trying Advanced Trade API',
+            'Advanced Trade API Params',
+            'Got candles using',
+            'Skipping hourly candle update',
+            'Hourly candle update already in progress'
+          ];
+          
+          if (filteredMessages.some(msg => info.message && info.message.includes && info.message.includes(msg))) {
             return false;
           }
           return info;
@@ -200,7 +213,11 @@ const logger = winston.createLogger({
       filename: path.join(logsDir, 'syrup-bot-combined.log'),
       maxsize: 10 * 1024 * 1024, // 10MB
       maxFiles: 7, // Keep 7 days of logs
-      tailable: true
+      tailable: true,
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+      )
     }),
     // Separate file for trade cycle data
     new winston.transports.File({
@@ -214,6 +231,18 @@ const logger = winston.createLogger({
       ),
       maxsize: 10 * 1024 * 1024, // 10MB
       maxFiles: 30, // Keep 30 days of trade cycle logs
+    }),
+    // File transport for all logs including debug
+    new winston.transports.File({
+      filename: path.join(logsDir, 'syrup-bot-debug.log'),
+      level: 'debug',
+      maxsize: 10485760, // 10MB
+      maxFiles: 5,
+      tailable: true,
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+      )
     })
   ]
 });
@@ -1059,15 +1088,22 @@ class SyrupTradingBot {
       logger.info(`Fetching window: ${currentStart.toISOString()} to ${currentEnd.toISOString()}`);
       
       try {
-        const response = await this.client.getPublicProductCandles({
+        // First try with Unix timestamps in seconds
+        const startUnix = Math.floor(currentStart.getTime() / 1000);
+        const endUnix = Math.floor(currentEnd.getTime() / 1000);
+        logger.debug(`Trying with Unix timestamps: start=${startUnix}, end=${endUnix}`);
+        
+        const apiResponse = await this.client.getPublicProductCandles({
           product_id: this.tradingPair,
-          start: Math.floor(currentStart.getTime() / 1000).toString(),
-          end: Math.floor(currentEnd.getTime() / 1000).toString(),
+          start: startUnix.toString(),
+          end: endUnix.toString(),
           granularity: 'ONE_MINUTE'
         });
         
-        if (response?.candles?.length > 0) {
-          const processed = this.processCandlesFromResponse(response);
+        logger.debug('Successfully fetched candles with Unix timestamps');
+        
+        if (apiResponse?.candles?.length > 0) {
+          const processed = this.processCandlesFromResponse(apiResponse);
           allCandles.push(...processed);
           logger.info(`Added ${processed.length} candles from window, total: ${allCandles.length}`);
         }
