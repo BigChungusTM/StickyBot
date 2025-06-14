@@ -519,21 +519,94 @@ class SyrupTradingBot {
   }
 
   /**
-   * Get formatted account balances for display
-   * @returns {Promise<string>} Formatted balance string
+   * Get formatted list of open orders for display in Telegram
+   * @returns {Promise<string>} Formatted open orders string or null if no orders
    */
-  async getFormattedBalances() {
+  async getFormattedOpenOrders() {
     try {
-      const accounts = await this.getAccountBalances();
-      const baseBalance = accounts[this.baseCurrency]?.available || '0.0';
-      const quoteBalance = accounts[this.quoteCurrency]?.available || '0.0';
+      // Get open orders from Coinbase service
+      const openOrders = await this.coinbaseService.getOpenOrders();
       
-      return `💰 *Account Balances* \n` +
-             `${this.baseCurrency}: *${parseFloat(baseBalance).toFixed(2)}*\n` +
-             `${this.quoteCurrency}: *${parseFloat(quoteBalance).toFixed(2)}*`;
+      // If no open orders, return null to show a different message
+      if (!openOrders || openOrders.length === 0) {
+        return null;
+      }
+      
+      // Format each order
+      const formattedOrders = [];
+      
+      for (let i = 0; i < openOrders.length; i++) {
+        try {
+          const order = openOrders[i];
+          const orderType = order.side === 'SELL' ? '🟢 Sell' : '🔵 Buy';
+          
+          // Extract order details from the nested structure
+          const orderConfig = order.order_configuration?.limit_limit_gtc || {};
+          
+          // Parse numeric values with proper error handling
+          const size = parseFloat(orderConfig.base_size || '0') || 0;
+          const filled = parseFloat(order.filled_size || '0') || 0;
+          const remaining = Math.max(0, size - filled); // Ensure non-negative
+          const price = parseFloat(orderConfig.limit_price || '0') || 0;
+          
+          console.log(`\n=== Processing order ${i + 1} ===`);
+          console.log('Order ID:', order.order_id);
+          console.log('Size:', size, 'Filled:', filled, 'Remaining:', remaining);
+          console.log('Price:', price, 'Type:', orderType);
+          
+          // Calculate filled percentage safely
+          let filledPct = 0;
+          if (size > 0) {
+            filledPct = Math.min(100, Math.max(0, (filled / size) * 100)); // Clamp between 0-100
+          }
+          
+          // Format values according to requirements
+          const formattedSize = remaining.toFixed(1); // XX.X format for SYRUP
+          const formattedPrice = price.toFixed(4);    // X.XXXX format for USDC
+          const orderValue = remaining * price;
+          const formattedValue = orderValue >= 0.01 ? orderValue.toFixed(2) : '<0.01'; // Handle very small values
+          
+          // Format the order line
+          const orderLines = [
+            `\n${i + 1}. ${orderType} ${formattedSize} ${this.baseCurrency} @ ${formattedPrice} ${this.quoteCurrency}`,
+            `   Status: ${order.status || 'UNKNOWN'} (${filledPct.toFixed(1)}% filled)`,
+            `   Value: ${formattedValue} ${this.quoteCurrency}`,
+            `   Created: ${new Date(order.created_time).toLocaleString()}`
+          ];
+          
+          // Add order ID if available
+          if (order.order_id && order.order_id !== 'N/A') {
+            orderLines.push(`   Order ID: ${order.order_id}`);
+          }
+          
+          formattedOrders.push(orderLines.join('\n'));
+          
+        } catch (err) {
+          console.error(`Error formatting order ${i + 1}:`, err);
+          // Skip this order but continue with others
+          continue;
+        }
+      }
+      
+      // If we couldn't format any orders, return null
+      if (formattedOrders.length === 0) {
+        console.error('No valid orders could be formatted');
+        return null;
+      }
+      
+      // Combine all orders into a single message
+      const header = `📋 *Open Orders (${formattedOrders.length})*`;
+      const message = [header, ...formattedOrders].join('\n');
+      
+      // Ensure the message isn't too long for Telegram (max 4096 chars)
+      const MAX_MESSAGE_LENGTH = 4000; // Leave some room for the header
+      return message.length > MAX_MESSAGE_LENGTH 
+        ? message.substring(0, MAX_MESSAGE_LENGTH) + '... (truncated)'
+        : message;
+      
     } catch (error) {
-      console.error('Error getting formatted balances:', error);
-      return '❌ Error fetching account balances. Please try again later.';
+      console.error('Error getting open orders:', error);
+      return '❌ Error fetching open orders. Please try again later.';
     }
   }
 

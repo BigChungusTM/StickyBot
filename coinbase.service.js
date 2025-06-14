@@ -43,6 +43,121 @@ class CoinbaseService {
     this.filledOrders = new Set();
   }
 
+  /**
+   * Get all open orders for the trading pair
+   * @returns {Promise<Array>} Array of open orders
+   */
+  async getOpenOrders(productId = 'SYRUP-USDC') {
+    try {
+      // Log the request parameters
+      const requestParams = {
+        order_status: 'OPEN',
+        product_id: productId,
+        order_type: 'UNKNOWN_ORDER_TYPE',
+        order_side: 'UNKNOWN_ORDER_SIDE',
+        start_sequence_timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+        end_sequence_timestamp: new Date().toISOString(),
+        limit: 100
+      };
+      
+      console.log('=== COINBASE SERVICE: Making getOrders request ===');
+      console.log('Request parameters:', JSON.stringify(requestParams, null, 2));
+      
+      // Get all open orders
+      const response = await this.client.getOrders(requestParams);
+      
+      console.log('=== COINBASE SERVICE: Received API Response ===');
+      console.log('Response keys:', Object.keys(response));
+      console.log('Raw API response (first 2000 chars):', JSON.stringify(response).substring(0, 2000));
+      
+      // Extract orders from the response
+      let orders = [];
+      if (Array.isArray(response.orders)) {
+        orders = response.orders;
+      } else if (response.orders && typeof response.orders === 'object') {
+        // Handle case where response.orders is an object
+        orders = [response.orders];
+      }
+      
+      console.log(`Found ${orders.length} orders in response`);
+      
+      // Format each order
+      const formattedOrders = orders.map((order, index) => {
+        console.log(`\n=== Processing order ${index + 1}/${orders.length} ===`);
+        console.log('Order keys:', order ? Object.keys(order) : 'Order is null/undefined');
+        console.log('Order data:', JSON.stringify(order, null, 2));
+        try {
+          console.log('Processing order:', JSON.stringify(order, null, 2));
+          
+          let size = '0';
+          let filled = '0';
+          let price = '0';
+          let orderType = 'UNKNOWN';
+          
+          // Extract order configuration
+          const config = order.order_configuration || {};
+          
+          // Find the active order type configuration
+          const activeConfig = Object.entries(config).find(([_, value]) => value !== null);
+          
+          if (activeConfig) {
+            const [configType, configData] = activeConfig;
+            orderType = configType.toUpperCase();
+            
+            // Extract size and price based on order type
+            if (configData.base_size) {
+              size = configData.base_size;
+            } else if (configData.quote_size) {
+              // For quote-sized orders, we'll need to calculate base size
+              size = configData.quote_size; // This will be updated with price if available
+            }
+            
+            // Get limit price if available
+            if (configData.limit_price) {
+              price = configData.limit_price;
+            } else if (order.average_filled_price) {
+              price = order.average_filled_price;
+            }
+            
+            // If we have a quote size but no price yet, we can't calculate base size
+            if (configData.quote_size && price && price !== '0') {
+              // Convert quote size to base size using the price
+              size = (parseFloat(configData.quote_size) / parseFloat(price)).toString();
+            }
+          }
+          
+          // Get filled size
+          filled = order.filled_size || '0';
+          
+          // Format the order object
+          const formattedOrder = {
+            id: order.order_id || 'N/A',
+            product_id: order.product_id || productId,
+            side: order.side || 'UNKNOWN',
+            status: order.status || 'UNKNOWN',
+            size: size,
+            filled_size: filled,
+            price: price,
+            created_at: order.created_time || new Date().toISOString(),
+            type: orderType
+          };
+          
+          console.log('Formatted order:', formattedOrder);
+          return formattedOrder;
+          
+        } catch (error) {
+          console.error('Error processing order:', error);
+          return null;
+        }
+      }).filter(order => order !== null); // Remove any null orders from processing errors
+      
+      return formattedOrders;
+    } catch (error) {
+      logger.error('Error fetching open orders:', error);
+      throw error;
+    }
+  }
+
   async getAccounts() { // Renamed from listAccounts to getAccounts
     try {
       // Corrected method name based on provided list
@@ -542,6 +657,34 @@ class CoinbaseService {
     const detailedError = new Error(errorMessage);
     detailedError.originalError = error;
     throw detailedError;
+  }
+
+  /**
+   * Get all open orders for the account
+   * @returns {Promise<Array>} - Array of open orders
+   */
+  async getOpenOrders() {
+    try {
+      // Get all orders with status 'OPEN'
+      const response = await this.client.getOrders({
+        order_status: 'OPEN',
+        limit: 100 // Maximum allowed by the API
+      });
+      
+      if (response && response.orders) {
+        return response.orders.filter(order => 
+          order && order.status === 'OPEN' && order.product_id === 'SYRUP-USDC'
+        );
+      }
+      return [];
+    } catch (error) {
+      console.error('Error fetching open orders:', error.message || error);
+      if (error.response) {
+        console.error('Error response status:', error.response.status);
+        console.error('Error response data:', JSON.stringify(error.response.data, null, 2));
+      }
+      throw error;
+    }
   }
 }
 

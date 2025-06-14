@@ -107,6 +107,7 @@ class TelegramService {
         🤖 *SYRUP Trading Bot Commands* \n\n` +
         `/status - Show bot status and current position\n` +
         `/balance - Show current account balances\n` +
+        `/orders - Show open orders\n` +
         `/trades - Show recent trades\n` +
         `/pause - Pause trading\n` +
         `/resume - Resume trading\n` +
@@ -138,6 +139,26 @@ class TelegramService {
       } catch (error) {
         console.error('Error in balance command:', error);
         await this.sendMessage(ctx.chat.id, '❌ Error fetching balances. Please try again later.');
+      }
+    });
+
+    // Orders command - Shows open orders
+    this.bot.command('orders', async (ctx) => {
+      try {
+        // Show typing indicator
+        await ctx.telegram.sendChatAction(ctx.chat.id, 'typing');
+        
+        // Get and format open orders
+        const ordersMessage = await this.tradingBot.getFormattedOpenOrders();
+        
+        if (ordersMessage) {
+          await this.sendMessage(ctx.chat.id, ordersMessage, { parse_mode: 'Markdown' });
+        } else {
+          await this.sendMessage(ctx.chat.id, '📭 No open orders found.');
+        }
+      } catch (error) {
+        console.error('Error in orders command:', error);
+        await this.sendMessage(ctx.chat.id, '❌ Error fetching open orders. Please try again later.');
       }
     });
 
