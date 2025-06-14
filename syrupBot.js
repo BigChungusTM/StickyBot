@@ -532,8 +532,10 @@ class SyrupTradingBot {
         return null;
       }
       
-      // Format each order
+      // Format each order and calculate total potential earnings
       const formattedOrders = [];
+      let totalPotentialEarnings = 0;
+      let totalSyrupForSale = 0;
       
       for (let i = 0; i < openOrders.length; i++) {
         try {
@@ -567,12 +569,26 @@ class SyrupTradingBot {
           const formattedValue = orderValue >= 0.01 ? orderValue.toFixed(2) : '<0.01'; // Handle very small values
           
           // Format the order line
+          // Calculate potential value for this order (only for sell orders)
+          let orderPotentialValue = 0;
+          if (order.side === 'SELL' && remaining > 0) {
+            orderPotentialValue = remaining * price;
+            totalPotentialEarnings += orderPotentialValue;
+            totalSyrupForSale += remaining;
+          }
+          
           const orderLines = [
             `\n${i + 1}. ${orderType} ${formattedSize} ${this.baseCurrency} @ ${formattedPrice} ${this.quoteCurrency}`,
             `   Status: ${order.status || 'UNKNOWN'} (${filledPct.toFixed(1)}% filled)`,
-            `   Value: ${formattedValue} ${this.quoteCurrency}`,
-            `   Created: ${new Date(order.created_time).toLocaleString()}`
+            `   Value: ${formattedValue} ${this.quoteCurrency}`
           ];
+          
+          // Add potential earnings for sell orders
+          if (order.side === 'SELL' && remaining > 0) {
+            orderLines.push(`   Potential: ${orderPotentialValue.toFixed(2)} ${this.quoteCurrency}`);
+          }
+          
+          orderLines.push(`   Created: ${new Date(order.created_time).toLocaleString()}`);
           
           // Add order ID if available
           if (order.order_id && order.order_id !== 'N/A') {
@@ -594,9 +610,21 @@ class SyrupTradingBot {
         return null;
       }
       
-      // Combine all orders into a single message
+      // Add summary of potential earnings from sell orders
+      let summaryLines = [];
+      if (totalSyrupForSale > 0) {
+        const avgSellPrice = totalPotentialEarnings / totalSyrupForSale;
+        summaryLines.push(
+          '\n💹 *Potential Earnings Summary*',
+          `Total ${this.baseCurrency} for Sale: ${totalSyrupForSale.toFixed(1)}`,
+          `Average Sell Price: ${avgSellPrice.toFixed(4)} ${this.quoteCurrency}`,
+          `Total Potential: ${totalPotentialEarnings.toFixed(2)} ${this.quoteCurrency}`
+        );
+      }
+      
+      // Combine all orders and summary into a single message
       const header = `📋 *Open Orders (${formattedOrders.length})*`;
-      const message = [header, ...formattedOrders].join('\n');
+      const message = [header, ...formattedOrders, ...summaryLines].join('\n');
       
       // Ensure the message isn't too long for Telegram (max 4096 chars)
       const MAX_MESSAGE_LENGTH = 4000; // Leave some room for the header
