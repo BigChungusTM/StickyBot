@@ -166,14 +166,31 @@ buyConfig: {
   maxDollarCostAveraging: 3, // Maximum DCA attempts per signal
   sellProfitTarget: 0.035,   // 3.5% profit target for limit sells
   
-  // 24h low scoring configuration
+  // 24h average low scoring configuration - points based on % above/below 24h average low
+  // Scores range from 0-10 with 0.5% increments from -5% to +5%
   low24hScoreRanges: [
-    { maxPercent: 1.0, score: 10 },   // 0-1% above 24h low
-    { maxPercent: 2.0, score: 8 },    // 1-2% above 24h low
-    { maxPercent: 3.0, score: 6 },    // 2-3% above 24h low
-    { maxPercent: 4.0, score: 4 },    // 3-4% above 24h low
-    { maxPercent: 5.0, score: 2 },    // 4-5% above 24h low
-    { maxPercent: Infinity, score: 0 } // >5% above 24h low
+    { maxPercent: -5.0, score: 10 },   // -5% or below 24h avg low: 10 points
+    { maxPercent: -4.5, score: 9.5 },  // -4.5% to -5%: 9.5 points
+    { maxPercent: -4.0, score: 9 },    // -4% to -4.5%: 9 points
+    { maxPercent: -3.5, score: 8.5 },  // -3.5% to -4%: 8.5 points
+    { maxPercent: -3.0, score: 8 },    // -3% to -3.5%: 8 points
+    { maxPercent: -2.5, score: 7.5 },  // -2.5% to -3%: 7.5 points
+    { maxPercent: -2.0, score: 7 },    // -2% to -2.5%: 7 points
+    { maxPercent: -1.5, score: 6.5 },  // -1.5% to -2%: 6.5 points
+    { maxPercent: -1.0, score: 6 },    // -1% to -1.5%: 6 points
+    { maxPercent: -0.5, score: 5.5 },  // -0.5% to -1%: 5.5 points
+    { maxPercent: 0.0, score: 5 },     // 0% to -0.5%: 5 points
+    { maxPercent: 0.5, score: 4.5 },   // 0% to 0.5%: 4.5 points
+    { maxPercent: 1.0, score: 4 },     // 0.5% to 1%: 4 points
+    { maxPercent: 1.5, score: 3.5 },   // 1% to 1.5%: 3.5 points
+    { maxPercent: 2.0, score: 3 },     // 1.5% to 2%: 3 points
+    { maxPercent: 2.5, score: 2.5 },   // 2% to 2.5%: 2.5 points
+    { maxPercent: 3.0, score: 2 },     // 2.5% to 3%: 2 points
+    { maxPercent: 3.5, score: 1.5 },   // 3% to 3.5%: 1.5 points
+    { maxPercent: 4.0, score: 1 },     // 3.5% to 4%: 1 point
+    { maxPercent: 4.5, score: 0.5 },   // 4% to 4.5%: 0.5 points
+    { maxPercent: 5.0, score: 0.1 },   // 4.5% to 5%: 0.1 points (min score)
+    { maxPercent: Infinity, score: 0 } // >5% above 24h avg low: 0 points
   ]
 }
 ```
@@ -229,13 +246,29 @@ Your support helps keep this project maintained and improved!
    - 3.0 points: >3.5% below 60-min high
 
 3. **24h Low Proximity (10 points total)**
-   The bot calculates a 24-hour average low using hourly candles from the past 24 hours. If hourly data is unavailable, it falls back to using 1-minute candles. The score is based on how close the current price is to this 24h average low.
+   The bot calculates a 24-hour average low using hourly candles from the past 24 hours. If hourly data is unavailable, it falls back to using 1-minute candles. The score is based on how close the current price is to this 24h average low, with more granular scoring at 0.5% increments. The system awards higher scores when the price is at or below the 24h average low.
 
-   - 10 points: 0-1% above 24h average low
-   - 8 points: 1-2% above 24h average low
-   - 6 points: 2-3% above 24h average low
-   - 4 points: 3-4% above 24h average low
-   - 2 points: 4-5% above 24h average low
+   - 10 points: -5% or below 24h average low
+   - 9.5 points: -4.5% to -5% below
+   - 9 points: -4% to -4.5% below
+   - 8.5 points: -3.5% to -4% below
+   - 8 points: -3% to -3.5% below
+   - 7.5 points: -2.5% to -3% below
+   - 7 points: -2% to -2.5% below
+   - 6.5 points: -1.5% to -2% below
+   - 6 points: -1% to -1.5% below
+   - 5.5 points: -0.5% to -1% below
+   - 5 points: 0% to -0.5% below
+   - 4.5 points: 0% to 0.5% above
+   - 4 points: 0.5% to 1% above
+   - 3.5 points: 1% to 1.5% above
+   - 3 points: 1.5% to 2% above
+   - 2.5 points: 2% to 2.5% above
+   - 2 points: 2.5% to 3% above
+   - 1.5 points: 3% to 3.5% above
+   - 1 point: 3.5% to 4% above
+   - 0.5 points: 4% to 4.5% above
+   - 0.1 points: 4.5% to 5% above
    - 0 points: >5% above 24h average low
    
    The scoring uses a dynamic range-based system that can be configured in `buyConfig.low24hScoreRanges`. The system calculates the percentage difference between the current price and the 24h average low, then assigns a score based on the configured ranges.
