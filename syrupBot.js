@@ -348,6 +348,9 @@ class SyrupTradingBot {
       ...config // Override defaults with provided config
     };
     
+    // Track active limit orders
+    this.activeLimitOrders = new Map();
+    
     this.processedConfirmations = new Set(); // Track processed confirmations
     this.client = client;
     this.coinbaseService = coinbaseService; // Initialize coinbaseService
@@ -2622,11 +2625,15 @@ class SyrupTradingBot {
   async notifyBuyOrder(order, amount, price, total) {
     if (!this.telegramService?.enabled) return;
     
+    // Calculate the actual total based on amount and price
+    const calculatedTotal = amount * price;
+    
+    // Use the calculated total instead of the passed total parameter
     const message = `✅ *BUY ORDER EXECUTED*\n` +
       `🔹 *Amount:* ${this.formatNumber(amount, 2)} ${this.baseCurrency}\n` +
       `🔹 *Price:* ${this.formatNumber(price, 4)} ${this.quoteCurrency}\n` +
-      `🔹 *Total:* ${this.formatNumber(total, 2)} ${this.quoteCurrency}\n` +
-      `🔹 *Order ID:* \`${order.id}\``;
+      `🔹 *Total:* ${this.formatNumber(calculatedTotal, 4)} ${this.quoteCurrency}\n` +
+      `🔹 *Order ID:* \`${order.id || 'N/A'}\``;
     
     await this.sendTelegramNotification(message);
   }
@@ -3570,13 +3577,98 @@ class SyrupTradingBot {
       return true;
     } catch (error) {
       logger.error('Failed to start trading cycle:', error);
-      this.isRunning = false;
       throw error;
     }
   }
 
+  /**
+   * Check for any filled limit orders and process them
+   */
+  async checkFilledLimitOrders() {
+    try {
+      if (this.activeLimitOrders.size === 0) return;
+      
+      logger.debug(`Checking ${this.activeLimitOrders.size} active limit orders...`);
+      
+      // Create a copy of the active orders to avoid modification during iteration
+      const orderIds = Array.from(this.activeLimitOrders.keys());
+      
+      for (const orderId of orderIds) {
+        try {
+          const orderInfo = this.activeLimitOrders.get(orderId);
+          if (!orderInfo) continue;
+          
+          logger.debug(`Checking status of limit order ${orderId}...`);
+          
+          // Check the order status
+          const status = await this.coinbaseService.getOrderStatus(orderId);
+          
+          if (status.status === 'FILLED' && !status.alreadyProcessed) {
+            logger.info(`Limit order ${orderId} has been filled!`);
+            
+            // Notify about the filled order
+            const { amount, buyPrice, orderType } = orderInfo;
+            const fillPrice = status.average_fill_price || orderInfo.price;
+            const total = parseFloat(fillPrice) * parseFloat(amount);
+            
+            // Send notification
+            await this.notifySellOrder(
+              status.order || { id: orderId },
+              parseFloat(amount),
+              parseFloat(fillPrice),
+              total,
+              ((fillPrice - buyPrice) / buyPrice * 100).toFixed(2)
+            );
+            
+            // Remove from active orders
+            this.activeLimitOrders.delete(orderId);
+            
+            logger.info(`Processed filled limit order ${orderId}`);
+          } else if (['CANCELLED', 'EXPIRED', 'REJECTED', 'FAILED'].includes(status.status)) {
+            logger.warn(`Limit order ${orderId} has status: ${status.status}`);
+            this.activeLimitOrders.delete(orderId);
+          }
+          
+        } catch (error) {
+          logger.error(`Error checking status of order ${orderId}:`, error.message || error);
+          // Don't remove the order on error - we'll try again next time
+        }
+      }
+      
+    } catch (error) {
+      logger.error('Error in checkFilledLimitOrders:', error.message || error);
+    }
+  }
+  
+  /**
+   * Add a limit order to the tracking system
+   * @param {string} orderId - The order ID from the exchange
+   * @param {number} amount - The amount of base currency in the order
+   * @param {number} price - The limit price of the order
+   * @param {number} buyPrice - The original buy price (for profit calculation)
+   * @param {string} orderType - Type of order (e.g., 'SELL_LIMIT')
+   */
+  trackLimitOrder(orderId, amount, price, buyPrice, orderType = 'SELL_LIMIT') {
+    if (!orderId) {
+      logger.warn('Cannot track order: No order ID provided');
+      return;
+    }
+    
+    this.activeLimitOrders.set(orderId, {
+      amount,
+      price,
+      buyPrice,
+      orderType,
+      timestamp: Date.now()
+    });
+    
+    logger.info(`Tracking new ${orderType} order ${orderId} for ${amount} @ ${price}`);
+  }
+
   async tradingLoop() {
     let lastHourlyUpdate = Date.now();
+    let lastOrderCheck = 0;
+    const ORDER_CHECK_INTERVAL = 30000; // Check order status every 30 seconds
     let cycleError = null;
     
     try {
@@ -3588,6 +3680,12 @@ class SyrupTradingBot {
           if (now - lastHourlyUpdate >= 3600000) {
             await this.updateHourlyCandles(true);
             lastHourlyUpdate = now;
+          }
+          
+          // Check for filled limit orders periodically
+          if (now - lastOrderCheck >= ORDER_CHECK_INTERVAL) {
+            await this.checkFilledLimitOrders();
+            lastOrderCheck = now;
           }
           
           // Fetch latest candle data

@@ -23,8 +23,6 @@ const logger = winston.createLogger({
   ]
 });
 
-// import { v4 as uuidv4 } from 'uuid'; // No longer needed
-
 class CoinbaseService {
   constructor() {
     // Create Advanced Trade client for most operations
@@ -40,6 +38,9 @@ class CoinbaseService {
       apiSecret: coinbaseConfig.apiSecret,
       // timeout: 5000, // Default is 5000 ms
     });
+    
+    // Track filled orders to avoid duplicate notifications
+    this.filledOrders = new Set();
   }
 
   async getAccounts() { // Renamed from listAccounts to getAccounts
@@ -494,17 +495,58 @@ class CoinbaseService {
       
       console.error(errorMessage);
       
-      // Re-throw with the detailed error message
-      const detailedError = new Error(errorMessage);
-      detailedError.originalError = error;
-      throw detailedError;
     }
+    
+    const params = {
+      client_order_id: clientOrderId,
+      product_id: productId,
+      side: sideUpper,
+      order_configuration: orderConfiguration,
+    };
+    
+    console.log('Submitting order with params:', JSON.stringify(params, null, 2));
+    
+    // Submit the order
+    const response = await this.client.submitOrder(params);
+    console.log('Order submission successful:', JSON.stringify(response, null, 2));
+    return response;
+  } catch (error) {
+    let errorMessage = `Error submitting ${orderType} ${side} order for ${productId}: `;
+    
+    // Extract detailed error information
+    if (error.response) {
+      const { status, statusText, data } = error.response;
+      errorMessage += `[${status}] ${statusText}`;
+      
+      console.error('Error response:', {
+        status,
+        statusText,
+        url: error.response.config?.url,
+        method: error.response.config?.method,
+        requestData: error.response.config?.data ? JSON.parse(error.response.config.data) : null,
+        responseData: data
+      });
+      
+      if (data && data.error) {
+        errorMessage += ` - ${data.error}`;
+        if (data.message) errorMessage += `: ${data.message}`;
+        if (data.error_details) errorMessage += ` (${JSON.stringify(data.error_details)})`;
+      }
+    } else {
+      errorMessage += error.message || 'Unknown error';
+    }
+    
+    console.error(errorMessage);
+    
+    // Re-throw with the detailed error message
+    const detailedError = new Error(errorMessage);
+    detailedError.originalError = error;
+    throw detailedError;
   }
 }
 
 // Create and export a single instance of the service
-export const coinbaseService = new CoinbaseService();
+const coinbaseService = new CoinbaseService();
 
-export default {
-  coinbaseService
-};
+export { coinbaseService };
+export default coinbaseService;
