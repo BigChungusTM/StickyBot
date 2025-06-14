@@ -2724,11 +2724,14 @@ class SyrupTradingBot {
     
     const profitEmoji = profitPct >= 0 ? '📈' : '📉';
     const profitText = profitPct >= 0 ? 'Profit' : 'Loss';
+    const isLimitOrder = order.order_type === 'limit' || order.type === 'limit';
+    const orderType = isLimitOrder ? 'LIMIT GTC' : 'MARKET';
     
-    const message = `💰 *SELL ORDER EXECUTED*\n` +
+    const message = `💰 *${orderType} SELL ORDER ${isLimitOrder ? 'PLACED' : 'EXECUTED'}*\n` +
       `🔹 *Amount:* ${this.formatNumber(amount, 2)} ${this.baseCurrency}\n` +
       `🔹 *Price:* ${this.formatNumber(price, 4)} ${this.quoteCurrency}\n` +
       `🔹 *Total:* ${this.formatNumber(total, 2)} ${this.quoteCurrency}\n` +
+      (isLimitOrder ? `🔹 *Time in Force:* GTC\n` : '') +
       `🔹 *${profitText}:* ${profitEmoji} ${Math.abs(profitPct).toFixed(2)}%\n` +
       `🔹 *Order ID:* \`${order.id}\``;
     
