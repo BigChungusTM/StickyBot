@@ -35,14 +35,14 @@ class TelegramService {
 
   initialize() {
     const token = process.env.TELEGRAM_BOT_TOKEN;
-    this.chatId = process.env.TELEGRAM_CHAT_ID || null;
+    this.chatId = process.env.TELEGRAM_CHAT_ID; // Removed null fallback to be explicit
     this.enabled = process.env.TELEGRAM_NOTIFICATIONS_ENABLED === 'true' && !!token && !!this.chatId;
 
     if (!this.enabled) {
       if (!token) {
         console.log('Telegram notifications disabled: No bot token provided');
       } else if (!this.chatId) {
-        console.log('Telegram notifications disabled: No chat ID provided');
+        console.log('Telegram notifications disabled: TELEGRAM_CHAT_ID environment variable is not set');
       } else {
         console.log('Telegram notifications are disabled in config');
       }
@@ -199,11 +199,11 @@ class TelegramService {
     }
 
     try {
-      // Always use the chat ID from the environment variables
-      const targetChatId = this.chatId;
+      // Use the provided chatId parameter, falling back to the instance chatId
+      const targetChatId = chatId || this.chatId;
       
       if (!targetChatId) {
-        console.error('No chat ID configured for Telegram messages');
+        console.error('No chat ID provided and no default chat ID configured');
         return false;
       }
 
@@ -220,8 +220,9 @@ class TelegramService {
     } catch (error) {
       console.error('Failed to send Telegram message:', {
         error: error.message,
-        chatId: this.chatId,
-        message: message.substring(0, 50) + (message.length > 50 ? '...' : '')
+        chatId: chatId || this.chatId || 'not set',
+        message: message.substring(0, 50) + (message.length > 50 ? '...' : ''),
+        stack: error.stack
       });
       return false;
     }

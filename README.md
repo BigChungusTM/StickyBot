@@ -229,12 +229,16 @@ Your support helps keep this project maintained and improved!
    - 3.0 points: >3.5% below 60-min high
 
 3. **24h Low Proximity (10 points total)**
-   - 10 points: 0-1% above 24h low
-   - 8 points: 1-2% above 24h low
-   - 6 points: 2-3% above 24h low
-   - 4 points: 3-4% above 24h low
-   - 2 points: 4-5% above 24h low
-   - 0 points: >5% above 24h low
+   The bot calculates a 24-hour average low using hourly candles from the past 24 hours. If hourly data is unavailable, it falls back to using 1-minute candles. The score is based on how close the current price is to this 24h average low.
+
+   - 10 points: 0-1% above 24h average low
+   - 8 points: 1-2% above 24h average low
+   - 6 points: 2-3% above 24h average low
+   - 4 points: 3-4% above 24h average low
+   - 2 points: 4-5% above 24h average low
+   - 0 points: >5% above 24h average low
+   
+   The scoring uses a dynamic range-based system that can be configured in `buyConfig.low24hScoreRanges`. The system calculates the percentage difference between the current price and the 24h average low, then assigns a score based on the configured ranges.
 
 4. **Confirmation System**
    - Requires 2/2 confirmations to trigger a buy
