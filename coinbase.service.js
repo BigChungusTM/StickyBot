@@ -7,14 +7,14 @@ import winston from 'winston';
 
 // Configure logger
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
+  level: process.env.LOG_LEVEL || 'debug', // Default to debug level
   format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.json()
   ),
   transports: [
     new winston.transports.Console({
-      level: 'warn', // Only show warnings and errors by default
+      level: process.env.LOG_LEVEL || 'debug', // Show debug logs by default
       format: winston.format.combine(
         winston.format.colorize(),
         winston.format.simple()
@@ -25,137 +25,336 @@ const logger = winston.createLogger({
 
 class CoinbaseService {
   constructor() {
-    // Create Advanced Trade client for most operations
-    this.client = new CoinbaseApi.CBAdvancedTradeClient({
-      apiKey: coinbaseConfig.apiKeyId,
-      apiSecret: coinbaseConfig.apiSecret,
-      // timeout: 5000, // Default is 5000 ms
+    this.logger = logger;
+    
+    // Log API key details (masked for security)
+    this.logger.debug('Initializing Coinbase API client with:', {
+      apiKeyPrefix: coinbaseConfig.apiKeyId ? `${coinbaseConfig.apiKeyId.substring(0, 5)}...${coinbaseConfig.apiKeyId.substring(coinbaseConfig.apiKeyId.length - 3)}` : 'missing',
+      apiSecretPrefix: coinbaseConfig.apiSecret ? '*** (set)' : 'missing',
+      hasLogger: !!logger
     });
     
-    // Create International client for additional API access
-    this.intlClient = new CoinbaseApi.CBInternationalClient({
-      apiKey: coinbaseConfig.apiKeyId,
-      apiSecret: coinbaseConfig.apiSecret,
-      // timeout: 5000, // Default is 5000 ms
-    });
-    
-    // Track filled orders to avoid duplicate notifications
-    this.filledOrders = new Set();
+    try {
+      // Create Advanced Trade client for most operations
+      this.client = new CoinbaseApi.CBAdvancedTradeClient({
+        apiKey: coinbaseConfig.apiKeyId,
+        apiSecret: coinbaseConfig.apiSecret,
+        // timeout: 5000, // Default is 5000 ms
+      });
+      
+      // Create International client for additional API access
+      this.intlClient = new CoinbaseApi.CBInternationalClient({
+        apiKey: coinbaseConfig.apiKeyId,
+        apiSecret: coinbaseConfig.apiSecret,
+        // timeout: 5000, // Default is 5000 ms
+      });
+      
+      this.logger.debug('Coinbase API clients initialized successfully', {
+        clientType: this.client ? 'initialized' : 'failed',
+        intlClientType: this.intlClient ? 'initialized' : 'failed'
+      });
+      
+      // Track filled orders to avoid duplicate notifications
+      this.filledOrders = new Set();
+      
+    } catch (error) {
+      this.logger.error('Failed to initialize Coinbase API clients:', error);
+      throw error;
+    }
   }
 
   /**
-   * Get all open orders for the trading pair
-   * @returns {Promise<Array>} Array of open orders
+   * Get account balances for all currencies
+   * @returns {Promise<Object>} Object with currency balances
    */
-  async getOpenOrders(productId = 'SYRUP-USDC') {
+  async getAccountBalances() {
     try {
-      // Log the request parameters
+      const accounts = await this.client.getAccounts();
+      const balances = {};
+      
+      if (accounts && Array.isArray(accounts.accounts)) {
+        accounts.accounts.forEach(account => {
+          const currency = account.currency;
+          balances[currency] = {
+            balance: account.available_balance?.value || '0',
+            available: account.available_balance?.value || '0',
+            hold: account.hold?.value || '0'
+          };
+        });
+      }
+      
+      return balances;
+    } catch (error) {
+      console.error('Error getting account balances:', error);
+      return {};
+    }
+  }
+
+  /**
+   * Get current ticker price for a product
+   * @param {string} productId - The trading pair (e.g., 'SYRUP-USDC')
+   * @returns {Promise<Object>} Ticker data including price
+   */
+  async getTicker(productId = 'SYRUP-USDC') {
+    try {
+      console.log(`[DEBUG] Fetching ticker for ${productId}`);
+      
+      // First try to get the ticker using the Public Market Trades endpoint
+      try {
+        const response = await this.client.getPublicMarketTrades({
+          product_id: productId,
+          limit: 1 // Only need the most recent trade
+        });
+        
+        console.log(`[DEBUG] Public Market Trades response for ${productId}:`, JSON.stringify(response, null, 2));
+        
+        // If we have trades, use the most recent one for the price
+        if (response && response.trades && response.trades.length > 0) {
+          const latestTrade = response.trades[0];
+          return {
+            price: latestTrade.price,
+            time: latestTrade.time,
+            bid: response.best_bid || latestTrade.price,
+            ask: response.best_ask || latestTrade.price,
+            volume_24h: '0', // Volume not available in this response
+            price_24h_change: '0' // 24h change not available
+          };
+        }
+      } catch (error) {
+        console.error(`[DEBUG] Public Market Trades error for ${productId}:`, error);
+      }
+      
+      // Fallback to private API if public fails
+      try {
+        const response = await this.client.getMarketTrades({
+          product_id: productId,
+          limit: 1 // Only need the most recent trade
+        });
+        
+        console.log(`[DEBUG] Private Market Trades response for ${productId}:`, JSON.stringify(response, null, 2));
+        
+        if (response && response.trades && response.trades.length > 0) {
+          const latestTrade = response.trades[0];
+          return {
+            price: latestTrade.price,
+            time: latestTrade.time,
+            bid: response.best_bid || latestTrade.price,
+            ask: response.best_ask || latestTrade.price,
+            volume_24h: '0', // Volume not available in this response
+            price_24h_change: '0' // 24h change not available
+          };
+        }
+      } catch (fallbackError) {
+        console.error(`[DEBUG] Private Market Trades error for ${productId}:`, fallbackError);
+      }
+      
+      // If we get here, all methods failed
+      console.error(`[DEBUG] All ticker fetch methods failed for ${productId}`);
+      return this._getDefaultTicker();
+      
+    } catch (error) {
+      console.error(`[ERROR] Unexpected error in getTicker for ${productId}:`, error);
+      return this._getDefaultTicker();
+    }  
+  }
+
+  /**
+   * Returns a default ticker object
+   * @private
+   * @returns {Object} Default ticker data
+   */
+  _getDefaultTicker() {
+    return {
+      price: '0',
+      time: new Date().toISOString(),
+      bid: '0',
+      ask: '0',
+      volume: '0'
+    };
+  }
+
+  /**
+   * Get all open limit sell orders for the trading pair
+   * @param {string} productId - The trading pair (e.g., 'SYRUP-USDC')
+   * @returns {Promise<Array>} Array of open limit sell order IDs
+   */
+  async getOpenLimitSellOrders(productId = 'SYRUP-USDC') {
+    try {
+      // Validate productId format
+      if (!productId || !productId.includes('-')) {
+        throw new Error(`Invalid productId: ${productId}. Expected format: 'BASE-QUOTE'`);
+      }
+      
+      // Prepare request parameters
       const requestParams = {
-        order_status: 'OPEN',
         product_id: productId,
-        order_type: 'UNKNOWN_ORDER_TYPE',
-        order_side: 'UNKNOWN_ORDER_SIDE',
-        start_sequence_timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-        end_sequence_timestamp: new Date().toISOString(),
+        order_status: 'OPEN',
+        order_type: 'LIMIT',
+        order_side: 'SELL',
         limit: 100
       };
       
-      console.log('=== COINBASE SERVICE: Making getOrders request ===');
-      console.log('Request parameters:', JSON.stringify(requestParams, null, 2));
+      this.logger.debug('Fetching open limit sell orders with params:', JSON.stringify(requestParams, null, 2));
       
-      // Get all open orders
-      const response = await this.client.getOrders(requestParams);
-      
-      console.log('=== COINBASE SERVICE: Received API Response ===');
-      console.log('Response keys:', Object.keys(response));
-      console.log('Raw API response (first 2000 chars):', JSON.stringify(response).substring(0, 2000));
-      
-      // Extract orders from the response
-      let orders = [];
-      if (Array.isArray(response.orders)) {
-        orders = response.orders;
-      } else if (response.orders && typeof response.orders === 'object') {
-        // Handle case where response.orders is an object
-        orders = [response.orders];
-      }
-      
-      console.log(`Found ${orders.length} orders in response`);
-      
-      // Format each order
-      const formattedOrders = orders.map((order, index) => {
-        console.log(`\n=== Processing order ${index + 1}/${orders.length} ===`);
-        console.log('Order keys:', order ? Object.keys(order) : 'Order is null/undefined');
-        console.log('Order data:', JSON.stringify(order, null, 2));
-        try {
-          console.log('Processing order:', JSON.stringify(order, null, 2));
+      try {
+        // Make the API request with enhanced error handling
+        this.logger.debug('Making API request to getOrders with params:', JSON.stringify(requestParams, null, 2));
+        const response = await this.client.getOrders(requestParams);
+        
+        // Log the raw response for debugging
+        this.logger.debug('=== RAW API RESPONSE ===');
+        this.logger.debug('Raw response type:', typeof response);
+        this.logger.debug('Raw response keys (if object):', response ? Object.keys(response) : 'N/A');
+        this.logger.debug('Raw response stringified:', JSON.stringify(response, null, 2));
+        
+        if (response) {
+          this.logger.debug('Response keys:', Object.keys(response));
+          this.logger.debug('Response type:', typeof response);
           
-          let size = '0';
-          let filled = '0';
-          let price = '0';
-          let orderType = 'UNKNOWN';
+          // Check if orders exist and log their structure
+          const hasOrders = !!response.orders;
+          this.logger.debug('Has orders:', hasOrders);
           
-          // Extract order configuration
-          const config = order.order_configuration || {};
-          
-          // Find the active order type configuration
-          const activeConfig = Object.entries(config).find(([_, value]) => value !== null);
-          
-          if (activeConfig) {
-            const [configType, configData] = activeConfig;
-            orderType = configType.toUpperCase();
+          if (hasOrders) {
+            const orders = response.orders;
+            this.logger.debug('Orders type:', typeof orders);
+            this.logger.debug('Is orders array:', Array.isArray(orders));
+            this.logger.debug('Number of orders:', orders.length);
             
-            // Extract size and price based on order type
-            if (configData.base_size) {
-              size = configData.base_size;
-            } else if (configData.quote_size) {
-              // For quote-sized orders, we'll need to calculate base size
-              size = configData.quote_size; // This will be updated with price if available
+            if (orders.length > 0) {
+              this.logger.debug('=== FIRST ORDER SAMPLE ===');
+              this.logger.debug('Order keys:', Object.keys(orders[0]));
+              this.logger.debug('Order type:', typeof orders[0]);
+              this.logger.debug('Full order data:', JSON.stringify(orders[0], null, 2));
+              
+              // Log all fields in the order for debugging
+              this.logger.debug('=== ORDER FIELDS ===');
+              Object.entries(orders[0]).forEach(([key, value]) => {
+                this.logger.debug(`${key}:`, JSON.stringify(value, null, 2));
+              });
+              
+              // Log specific fields we're interested in
+              const order = orders[0];
+              this.logger.debug('=== ORDER DETAILS ===');
+              this.logger.debug('Order ID:', order.id || order.order_id);
+              this.logger.debug('Possible price fields:', {
+                price: order.price,
+                limit_price: order.limit_price,
+                execution_price: order.execution_price,
+                average_filled_price: order.average_filled_price,
+                price_level: order.price_level,
+                stop_price: order.stop_price
+              });
+              this.logger.debug('Possible size fields:', {
+                size: order.size,
+                quantity: order.quantity,
+                base_size: order.base_size,
+                executed_value: order.executed_value
+              });
+              this.logger.debug('Order side:', order.side);
+              this.logger.debug('Order type:', order.type);
+              this.logger.debug('Order status:', order.status);
+              this.logger.debug('Order product_id:', order.product_id);
+            } else {
+              this.logger.debug('Orders array is empty');
             }
+          } else {
+            this.logger.debug('No orders found in response');
+          }
+        }
+        
+        // Extract order IDs from the response
+        const orderIds = [];
+        
+        if (response?.orders && Array.isArray(response.orders)) {
+          for (const [index, order] of response.orders.entries()) {
+            this.logger.debug(`Processing order ${index + 1}/${response.orders.length}:`, {
+              orderId: order.id,
+              orderSide: order.side,
+              orderType: order.type,
+              orderStatus: order.status,
+              productId: order.product_id,
+              price: order.price,
+              size: order.size || order.quantity
+            });
             
-            // Get limit price if available
-            if (configData.limit_price) {
-              price = configData.limit_price;
-            } else if (order.average_filled_price) {
-              price = order.average_filled_price;
-            }
-            
-            // If we have a quote size but no price yet, we can't calculate base size
-            if (configData.quote_size && price && price !== '0') {
-              // Convert quote size to base size using the price
-              size = (parseFloat(configData.quote_size) / parseFloat(price)).toString();
+            // Use either order_id or id, whichever is available
+            const orderId = order.order_id || order.id;
+            if (orderId) {
+              // Try to find the price in various possible fields
+              const price = order.price || 
+                           order.limit_price || 
+                           order.execution_price || 
+                           order.average_filled_price ||
+                           order.price_level ||
+                           order.stop_price ||
+                           '0';
+                            
+              // Try to find the size in various possible fields
+              const size = order.size || 
+                         order.quantity || 
+                         order.base_size || 
+                         order.executed_value ||
+                         '0';
+              
+              const orderData = {
+                id: orderId,
+                price: price,
+                size: size,
+                side: order.side,
+                type: order.type,
+                status: order.status,
+                product_id: order.product_id,
+                created_at: order.created_at || order.created_time || new Date().toISOString(),
+                // Include all fields for debugging
+                _raw: order
+              };
+              
+              this.logger.debug(`Processed order ${orderId}:`, {
+                price: orderData.price,
+                size: orderData.size,
+                side: orderData.side,
+                type: orderData.type
+              });
+              
+              orderIds.push(orderData);
+            } else {
+              this.logger.warn('Order has no valid ID field:', order);
             }
           }
-          
-          // Get filled size
-          filled = order.filled_size || '0';
-          
-          // Format the order object
-          const formattedOrder = {
-            id: order.order_id || 'N/A',
-            product_id: order.product_id || productId,
-            side: order.side || 'UNKNOWN',
-            status: order.status || 'UNKNOWN',
-            size: size,
-            filled_size: filled,
-            price: price,
-            created_at: order.created_time || new Date().toISOString(),
-            type: orderType
-          };
-          
-          console.log('Formatted order:', formattedOrder);
-          return formattedOrder;
-          
-        } catch (error) {
-          console.error('Error processing order:', error);
-          return null;
         }
-      }).filter(order => order !== null); // Remove any null orders from processing errors
+        
+        this.logger.info(`Found ${orderIds.length} open limit sell orders for ${productId}`);
+        return orderIds;
+        
+      } catch (apiError) {
+        this.logger.error('API Error in getOpenLimitSellOrders:', {
+          message: apiError.message,
+          code: apiError.code,
+          response: apiError.response?.data,
+          stack: apiError.stack
+        });
+        return [];
+      }
       
-      return formattedOrders;
     } catch (error) {
-      logger.error('Error fetching open orders:', error);
-      throw error;
+      this.logger.error('Error fetching open limit sell orders:', {
+        message: error.message,
+        code: error.code,
+        stack: error.stack
+      });
+      return [];
     }
+  }
+  
+  /**
+   * Get all open orders for the trading pair (legacy method, consider using getOpenLimitSellOrders instead)
+   * @param {string} productId - The trading pair (e.g., 'SYRUP-USDC')
+   * @returns {Promise<Array>} Array of open orders
+   */
+  async getOpenOrders(productId = 'SYRUP-USDC') {
+    // For backward compatibility, call getOpenLimitSellOrders
+    return this.getOpenLimitSellOrders(productId);
   }
 
   async getAccounts() { // Renamed from listAccounts to getAccounts
@@ -660,30 +859,133 @@ class CoinbaseService {
   }
 
   /**
+   * Cancel an order by ID
+   * @param {string} orderId - The ID of the order to cancel
+   * @returns {Promise<Object>} - The cancellation response
+   */
+  async cancelOrder(orderId) {
+    if (!orderId) {
+      throw new Error('Order ID is required to cancel an order');
+    }
+
+    try {
+      logger.info(`Attempting to cancel order ${orderId}...`);
+      
+      // First try to cancel using the Advanced Trade client
+      try {
+        const response = await this.client.cancelOrder({
+          order_id: orderId
+        });
+        
+        logger.info(`Successfully cancelled order ${orderId}`);
+        return response;
+      } catch (advancedError) {
+        logger.warn(`Advanced Trade cancelOrder failed: ${advancedError.message}`);
+        
+        // If Advanced Trade fails, try with the International client as fallback
+        try {
+          const response = await this.intlClient.cancelOrder({
+            id: orderId,
+            portfolio: coinbaseConfig.portfolioName || 'default'
+          });
+          
+          logger.info(`Successfully cancelled order ${orderId} using International API`);
+          return response;
+        } catch (intlError) {
+          logger.error(`International API cancelOrder also failed: ${intlError.message}`);
+          
+          // If both fail, try the raw API call as last resort
+          try {
+            const response = await this.client.post(`/orders/${orderId}/cancel`);
+            logger.info(`Successfully cancelled order ${orderId} using direct API call`);
+            return response;
+          } catch (rawError) {
+            logger.error(`All cancellation attempts failed for order ${orderId}`);
+            throw new Error(`Failed to cancel order ${orderId}: ${rawError.message}`);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`Error in cancelOrder for ${orderId}:`, {
+        message: error.message,
+        stack: error.stack,
+        response: error.response?.data
+      });
+      
+      // Special handling for already cancelled or filled orders
+      if (error.message.includes('not found') || 
+          error.message.includes('not found') || 
+          error.message.includes('already done') ||
+          error.message.includes('not open') ||
+          error.response?.status === 404) {
+        logger.warn(`Order ${orderId} may already be filled or cancelled`);
+        return { success: true, message: 'Order already filled or cancelled' };
+      }
+      
+      throw error;
+    }
+  }
+
+  /**
    * Get all open orders for the account
-   * @returns {Promise<Array>} - Array of open orders
+   * @returns {Promise<Array>} - Array of open orders with detailed information
    */
   async getOpenOrders() {
     try {
-      // Get all orders with status 'OPEN'
+      logger.info('Fetching open orders from Coinbase...');
+      
+      // Get all orders with status 'OPEN' for SYRUP-USDC
       const response = await this.client.getOrders({
         order_status: 'OPEN',
-        limit: 100 // Maximum allowed by the API
+        product_id: 'SYRUP-USDC',
+        limit: 100, // Maximum allowed by the API
+        order_side: 'SELL' // Only get sell orders for now
       });
       
-      if (response && response.orders) {
-        return response.orders.filter(order => 
-          order && order.status === 'OPEN' && order.product_id === 'SYRUP-USDC'
+      if (response?.orders?.length) {
+        logger.info(`Found ${response.orders.length} open orders`);
+        
+        // Enrich order data with additional details
+        const enrichedOrders = await Promise.all(
+          response.orders
+            .filter(order => order?.product_id === 'SYRUP-USDC')
+            .map(async (order) => {
+              try {
+                // Get order details including fills
+                const orderDetails = await this.client.getOrder({
+                  order_id: order.order_id
+                });
+                
+                return {
+                  ...order,
+                  ...(orderDetails || {}),
+                  // Add human-readable timestamps
+                  created_at: order.created_time ? new Date(order.created_time).toISOString() : null,
+                  updated_at: order.last_updated_time ? new Date(order.last_updated_time).toISOString() : null
+                };
+              } catch (err) {
+                logger.error(`Error fetching details for order ${order.order_id}:`, err);
+                return order; // Return basic order info if details fetch fails
+              }
+            })
         );
+        
+        return enrichedOrders;
       }
+      
+      logger.info('No open orders found');
       return [];
+      
     } catch (error) {
-      console.error('Error fetching open orders:', error.message || error);
-      if (error.response) {
-        console.error('Error response status:', error.response.status);
-        console.error('Error response data:', JSON.stringify(error.response.data, null, 2));
-      }
-      throw error;
+      logger.error('Error in getOpenOrders:', {
+        message: error.message,
+        code: error.code,
+        status: error.response?.status,
+        data: error.response?.data
+      });
+      
+      // Return empty array instead of throwing to prevent command failure
+      return [];
     }
   }
 }

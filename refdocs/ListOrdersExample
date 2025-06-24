@@ -1,0 +1,499 @@
+GET
+https://api.exchange.coinbase.com/orders
+
+List your current open orders. Only open or un-settled orders are returned by default. As soon as an order is no longer open and settled, it will no longer appear in the default request. Open orders may change state between the request and the response depending on market conditions.
+
+Pending Orders
+Orders with a "pending" status have fewer fields in the response.
+
+Pending limit orders do not have stp, time_in_force, expire_time, and post_only.
+Pending market orders have the same fields as a pending limit order minus price and size, and no market specific fields (funds, specified_funds).
+Pending stop orders have the same fields as a pending limit order and no stop specific fields (stop, stop_price).
+Order Type
+Does Not Have These Fields
+Pending Limit Order
+stp, time_in_force, expire_time, post_only
+Pending Market Order
+stp, time_in_force, expire_time, post_only, price, size, funds, specified_funds
+Pending Stop Order
+stp, time_in_force, expire_time, post_only, stop, stop_price
+
+API Key Permissions
+This endpoint requires either the "view" or "trade" permission.
+
+
+Tip
+To specify multiple statuses, use the status query argument multiple times: /orders?status=done&status=pending.
+
+Order Status and Settlement
+Orders which are no longer resting on the order book, are marked with the done status. There is a small window between an order being done and settled. An order is settled when all of the fills have settled and the remaining holds (if any) have been removed.
+
+Polling
+For high-volume trading it is strongly recommended that you maintain your own list of open orders and use one of the streaming market data feeds to keep it updated. You should poll the open orders endpoint once when you start trading to obtain the current state of any open orders.
+
+executed_value is the cumulative match size * price and is only present for orders placed after 2016-05-20.
+
+
+Info
+Open orders can change state between the request and the response depending on market conditions.
+
+Pagination
+This request is paginated. See Pagination for more information.
+
+Authentication
+cb-access-key
+string
+required
+cb-access-passphrase
+string
+required
+cb-access-sign
+string
+required
+cb-access-timestamp
+string
+required
+Query Params
+profile_id
+string
+Filter results by a specific profile_id
+
+product_id
+string
+Filter results by a specific product_id
+
+sortedBy
+string
+Sort criteria for results.
+
+created_at
+
+sorting
+string
+Ascending or descending order, by sortedBy
+
+desc
+
+start_date
+date-time
+Filter results by minimum posted date
+
+end_date
+date-time
+Filter results by maximum posted date
+
+before
+string
+Used for pagination. Sets start cursor to before date.
+
+after
+string
+Used for pagination. Sets end cursor to after date.
+
+limit
+int64
+required
+Limit on number of results to return.
+
+100
+status
+string[]
+required
+Array with order statuses to filter by.
+
+
+Add string
+market_type
+string
+Market type which the order was traded in.
+
+spot
+Responses
+
+200
+
+401
+Unauthorized.
+
+
+500
+An unexpected error response.
+
+Previous
+Get all fills
+Next
+Get single order
+Language
+Request
+1
+curl -L 'https://api.exchange.coinbase.com/orders' \
+2
+-H 'Content-Type: application/json'
+Wrap lines
+Response
+{
+  "description": "",
+  "schema": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "example": {
+        "id": "a9625b04-fc66-4999-a876-543c3684d702",
+        "price": "10.00000000",
+        "size": "1.00000000
+1
+{
+2
+  "description": "",
+3
+  "schema": {
+4
+    "type": "array",
+5
+    "items": {
+6
+      "type": "object",
+7
+      "example": {
+8
+        "id": "a9625b04-fc66-4999-a876-543c3684d702",
+9
+        "price": "10.00000000",
+10
+        "size": "1.00000000",
+11
+        "product_id": "BTC-USD",
+12
+        "profile_id": "8058d771-2d88-4f0f-ab6e-299c153d4308",
+13
+        "side": "buy",
+14
+        "type": "limit",
+15
+        "time_in_force": "GTC",
+16
+        "post_only": true,
+17
+        "max_floor": "4",
+18
+        "created_at": "2020-03-11T20:48:46.622052Z",
+19
+        "fill_fees": "0.0000000000000000",
+20
+        "filled_size": "0.00000000",
+21
+        "executed_value": "0.0000000000000000",
+22
+        "status": "open",
+23
+        "settled": false
+24
+      },
+25
+      "properties": {
+26
+        "id": {
+27
+          "type": "string",
+28
+          "description": "uuid"
+29
+        },
+30
+        "price": {
+31
+          "type": "string",
+32
+          "description": "price per unit of base currency"
+33
+        },
+34
+        "size": {
+35
+          "type": "string",
+36
+          "description": "amount of base currency to buy/sell"
+37
+        },
+38
+        "product_id": {
+39
+          "type": "string",
+40
+          "description": "book the order was placed on"
+41
+        },
+42
+        "profile_id": {
+43
+          "type": "string",
+44
+          "description": "profile_id that placed the order"
+45
+        },
+46
+        "side": {
+47
+          "type": "string",
+48
+          "enum": [
+49
+            "buy",
+50
+            "sell"
+51
+          ],
+52
+          "default": "buy"
+53
+        },
+54
+        "funds": {
+55
+          "type": "string",
+56
+          "description": "amount of quote currency to spend (for market orders)"
+57
+        },
+58
+        "specified_funds": {
+59
+          "type": "string",
+60
+          "description": "funds with fees"
+61
+        },
+62
+        "type": {
+63
+          "type": "string",
+64
+          "enum": [
+65
+            "limit",
+66
+            "market",
+67
+            "stop"
+68
+          ],
+69
+          "default": "limit"
+70
+        },
+71
+        "time_in_force": {
+72
+          "type": "string",
+73
+          "enum": [
+74
+            "GTC",
+75
+            "GTT",
+76
+            "IOC",
+77
+            "FOK"
+78
+          ],
+79
+          "default": "GTC"
+80
+        },
+81
+        "expire_time": {
+82
+          "type": "string",
+83
+          "format": "date-time",
+84
+          "description": "timestamp at which order expires"
+85
+        },
+86
+        "post_only": {
+87
+          "type": "boolean",
+88
+          "description": "if true, forces order to be `maker` only"
+89
+        },
+90
+        "created_at": {
+91
+          "type": "string",
+92
+          "format": "date-time",
+93
+          "description": "timestamp at which order was placed"
+94
+        },
+95
+        "done_at": {
+96
+          "type": "string",
+97
+          "format": "date-time",
+98
+          "description": "timestamp at which order was done"
+99
+        },
+100
+        "done_reason": {
+101
+          "type": "string",
+102
+          "description": "reason order was done (filled, rejected, or otherwise)"
+103
+        },
+104
+        "reject_reason": {
+105
+          "type": "string",
+106
+          "description": "reason order was rejected by engine"
+107
+        },
+108
+        "fill_fees": {
+109
+          "type": "string",
+110
+          "description": "fees paid on current filled amount"
+111
+        },
+112
+        "filled_size": {
+113
+          "type": "string",
+114
+          "description": "amount (in base currency) of the order that has been filled"
+115
+        },
+116
+        "executed_value": {
+117
+          "type": "string"
+118
+        },
+119
+        "status": {
+120
+          "type": "string",
+121
+          "enum": [
+122
+            "open",
+123
+            "pending",
+124
+            "rejected",
+125
+            "done",
+126
+            "active",
+127
+            "received",
+128
+            "all"
+129
+          ],
+130
+          "default": "open"
+131
+        },
+132
+        "settled": {
+133
+          "type": "boolean",
+134
+          "description": "true if funds have been exchanged and settled"
+135
+        },
+136
+        "stop": {
+137
+          "type": "string",
+138
+          "enum": [
+139
+            "loss",
+140
+            "entry"
+141
+          ],
+142
+          "default": "loss"
+143
+        },
+144
+        "stop_price": {
+145
+          "type": "string",
+146
+          "description": "price (in quote currency) at which to execute the order"
+147
+        },
+148
+        "funding_amount": {
+149
+          "type": "string"
+150
+        },
+151
+        "client_oid": {
+152
+          "type": "string",
+153
+          "description": "client order id"
+154
+        },
+155
+        "market_type": {
+156
+          "type": "string",
+157
+          "description": "market type where order was traded"
+158
+        },
+159
+        "stop_limit_price": {
+160
+          "type": "string",
+161
+          "description": "stop limit price for TPSL order"
+162
+        }
+163
+      },
+164
+      "required": [
+165
+        "id",
+166
+        "product_id",
+167
+        "side",
+168
+        "type",
+169
+        "post_only",
+170
+        "created_at",
+171
+        "fill_fees",
+172
+        "filled_size",
+173
+        "status",
+174
+        "settled"
+175
+      ]
+176
+    }
+177
+  }
+178
+}

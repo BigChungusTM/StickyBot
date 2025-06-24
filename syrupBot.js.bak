@@ -3,7 +3,6 @@ import dotenv from 'dotenv';
 import winston from 'winston';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import TrailingStopManager from './trailingStopManager.js';
 import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import axios from 'axios';
@@ -182,21 +181,13 @@ const logger = winston.createLogger({
     winston.format.json()
   ),
   transports: [
-    // Console transport - show more detailed logs for trailing stop
+    // Console transport - filter out verbose logs
     new winston.transports.Console({
-      level: process.env.LOG_LEVEL || 'info', // Show more detailed logs by default
+      level: 'warn', // Only show warnings and errors by default
       format: winston.format.combine(
         winston.format.colorize(),
         winston.format.simple(),
         winston.format((info) => {
-          // Always show trailing stop related logs
-          if (info.message && 
-              (info.message.includes('[TRAILING STOP]') || 
-               info.message.includes('ACTIVE SELL LIMIT') ||
-               info.message.includes('ORDER '))) {
-            return info;
-          }
-          
           // Filter out verbose logs from console
           const filteredMessages = [
             'TRADE_CYCLE',
@@ -364,10 +355,6 @@ class SyrupTradingBot {
     this.client = client;
     this.coinbaseService = coinbaseService; // Initialize coinbaseService
     this.telegramService = telegramService; // Initialize telegramService
-    
-    // Initialize TrailingStopManager
-    this.trailingStop = new TrailingStopManager(this.coinbaseService, logger);
-    logger.info('Trailing stop manager initialized');
     
     // Initialize Telegram command handlers if Telegram is enabled
     if (this.telegramService.enabled) {
@@ -3672,153 +3659,28 @@ class SyrupTradingBot {
                  `drift: ${drift}ms)`);
   }
 
-  /**
-   * Check for existing sell orders at startup and track them
-   * @private
-   */
-  async checkForExistingSellOrders() {
-    try {
-      logger.info('🔍 [ONE-TIME CHECK] Checking for existing open sell orders...');
-      
-      // Get all open orders for the trading pair
-      const openOrders = await this.coinbaseService.getOpenOrders(this.tradingPair);
-      
-      logger.debug(`[ONE-TIME CHECK] getOpenOrders response: ${JSON.stringify(openOrders, null, 2)}`);
-      
-      if (openOrders && openOrders.orders && openOrders.orders.length > 0) {
-        logger.info(`📊 Found ${openOrders.orders.length} open sell order(s) at startup`);
-        
-        // Filter for SELL and LIMIT orders
-        const sellLimitOrders = openOrders.orders.filter(order => 
-          order.order_type === 'LIMIT' && 
-          (order.side === 'SELL' || order.side === 'SELL_LIMIT')
-        );
-        
-        // Log details of each open order
-        sellLimitOrders.forEach((order, index) => {
-          const orderId = order.order_id || 'unknown';
-          const price = order.price || 'unknown';
-          const size = order.size || 'unknown';
-          const filled = order.filled_size || '0';
-          const remaining = order.remaining_size || size;
-          const type = order.order_type || 'unknown';
-          const timeInForce = order.time_in_force || 'GTC';
-          
-          logger.info(`  Order #${index + 1}:`);
-          logger.info(`    ID: ${orderId}`);
-          logger.info(`    Type: ${type} (${timeInForce})`);
-          logger.info(`    Price: ${price} ${this.quoteCurrency}`);
-          logger.info(`    Size: ${size} ${this.baseCurrency}`);
-          logger.info(`    Filled: ${filled} ${this.baseCurrency}`);
-          logger.info(`    Remaining: ${remaining} ${this.baseCurrency}`);
-          
-          // Track the limit order
-          if (orderId && price && size) {
-            this.trackLimitOrder(
-              orderId,
-              parseFloat(remaining),
-              parseFloat(price),
-              0, // Unknown buy price for existing orders
-              'SELL_LIMIT'
-            );
-            logger.info('    ✅ Added to active limit orders tracking');
-          }
-        });
-        
-        // Notify via Telegram if available
-        if (this.telegramService?.enabled) {
-          const message = `🔍 Found ${sellLimitOrders.length} open sell order(s) at startup. ` +
-                         'Type /orders to view details.';
-          await this.telegramService.sendMessage(message);
-        }
-      } else {
-        logger.info('ℹ️ No open sell orders found at startup');
-      }
-    } catch (error) {
-      logger.error('❌ Error checking for open sell orders:', error);
-      // Don't throw, just log the error
-    }
-  }
-
-  /**
-   * Start the main trading cycle
-   * @returns {Promise<boolean>} True if the trading cycle started successfully
-   */
   async startTradingCycle() {
     if (this.isRunning) {
-      logger.warn('Trading cycle is already running');
-      return false;
+      logger.warn('Trading cycle already running');
+      return;
     }
 
-    this.isRunning = true;
-    logger.info('🚀 Starting trading cycle...');
-
     try {
-      // Initialize the bot
-      logger.info('🔄 Initializing trading bot...');
+      logger.info('Starting trading cycle...');
+      this.isRunning = true;
+      
+      // Initialize accounts and load initial data
+      await this.loadAccounts();
       await this.initialize();
-      logger.info('✅ Trading bot initialized successfully');
       
-      // Check for existing sell orders
-      logger.info('🔍 Checking for existing sell orders...');
-      await this.checkForExistingSellOrders();
-      logger.info('✅ Existing sell orders checked');
-      
-      // Initialize and start the trailing stop manager
-      try {
-        logger.info('🚀 [TRAILING STOP] Initializing trailing stop manager...');
-        const initialized = await this.trailingStop.initialize();
-        
-        if (!initialized) {
-          throw new Error('Failed to initialize trailing stop manager');
-        }
-        
-        logger.info('✅ [TRAILING STOP] Trailing stop manager initialized');
-        
-        // Start the trailing stop manager
-        logger.info('🚀 [TRAILING STOP] Starting trailing stop manager...');
-        const started = await this.trailingStop.start();
-        
-        if (!started) {
-          throw new Error('Failed to start trailing stop manager');
-        }
-        
-        logger.info('✅ [TRAILING STOP] Trailing stop manager started successfully');
-        
-      } catch (error) {
-        logger.error('❌ [TRAILING STOP] Error in trailing stop manager:', error);
-        // Attempt to stop the trailing stop manager if it was partially started
-        try {
-          if (this.trailingStop) {
-            await this.trailingStop.stop();
-          }
-        } catch (stopError) {
-          logger.error('❌ [TRAILING STOP] Error stopping trailing stop manager:', stopError);
-        }
-        // Continue with the trading cycle even if trailing stop fails
-      }
-      
-      // Start the trading loop
-      logger.info('🔄 Starting main trading loop...');
-      await this.tradingLoop();
-      logger.info('✅ Trading loop completed');
+      // Start the main trading loop
+      this.tradingLoop().catch(error => {
+        logger.error('Error in trading loop:', error);
+      });
       
       return true;
-      
     } catch (error) {
-      logger.error('❌ Error in trading cycle:', error);
-      
-      // Make sure to stop the trailing stop manager on error
-      if (this.trailingStop && typeof this.trailingStop.stop === 'function') {
-        try {
-          logger.info('🛑 Stopping trailing stop manager due to error...');
-          await this.trailingStop.stop();
-        } catch (stopError) {
-          logger.error('❌ Error stopping trailing stop manager:', stopError);
-        }
-      }
-      
-      this.isRunning = false;
+      logger.error('Failed to start trading cycle:', error);
       throw error;
     }
   }
@@ -3912,28 +3774,12 @@ class SyrupTradingBot {
     let lastOrderCheck = 0;
     const ORDER_CHECK_INTERVAL = 30000; // Check order status every 30 seconds
     let cycleError = null;
-    let lastMinute = -1; // Track the last minute we processed
     
     try {
       while (this.isRunning) {
-        const now = new Date();
-        const currentMinute = now.getMinutes();
-        const currentSecond = now.getSeconds();
-        const currentMs = now.getMilliseconds();
-        
-        // Calculate time until next minute + 500ms
-        const msUntilNextMinute = (60 - currentSecond) * 1000 - currentMs + 500;
-        
         try {
-          // If we've crossed into a new minute, wait until 500ms past the minute
-          if (currentMinute !== lastMinute) {
-            lastMinute = currentMinute;
-            
-            // If we're not already past the 500ms mark, wait until then
-            if (currentSecond === 0 && currentMs < 500) {
-              await new Promise(resolve => setTimeout(resolve, 500 - currentMs));
-            }
-          }
+          const now = Date.now();
+          
           // Update hourly candles every hour
           if (now - lastHourlyUpdate >= 3600000) {
             await this.updateHourlyCandles(true);
@@ -3944,9 +3790,6 @@ class SyrupTradingBot {
           if (now - lastOrderCheck >= ORDER_CHECK_INTERVAL) {
             await this.checkFilledLimitOrders();
             lastOrderCheck = now;
-            
-            // Log current status every time we check orders (every 30s)
-            this.logTradeCycle();
           }
           
           // Fetch latest candle data
@@ -3958,15 +3801,15 @@ class SyrupTradingBot {
             
             // Check and execute trades
             await this.checkAndExecuteTrades();
+            
+            // Log current status periodically
+            if (now % 60000 < 1000) { // Log roughly every minute
+              this.logTradeCycle();
+            }
           }
           
-          // Calculate time to sleep until next cycle
-          const nowMs = Date.now();
-          const nextCycleTime = Math.ceil(nowMs / 60000) * 60000 + 500; // Next :00.5
-          const sleepTime = Math.max(100, nextCycleTime - nowMs); // At least 100ms sleep
-          
-          // Sleep until next cycle
-          await new Promise(resolve => setTimeout(resolve, sleepTime));
+          // Wait until the next minute
+          await this.waitForNextMinute();
           
         } catch (error) {
           logger.error('Error in trading cycle iteration:', error);
@@ -3977,17 +3820,6 @@ class SyrupTradingBot {
     } finally {
       // Final cleanup
       this.isRunning = false;
-      
-      // Stop the trailing stop manager when the trading loop ends
-      if (this.trailingStop) {
-        try {
-          logger.info('🛑 Stopping trailing stop manager...');
-          await this.trailingStop.stop();
-        } catch (stopError) {
-          logger.error('Error stopping trailing stop manager:', stopError);
-        }
-      }
-      
       logger.info('Trading cycle stopped');
     }
   }
