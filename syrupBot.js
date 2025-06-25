@@ -2187,6 +2187,158 @@ class SyrupTradingBot {
   }
 
   /**
+   * Calculates the 60-minute high price and percentage above/below current price
+   * @param {number} currentPrice - The current price to evaluate against
+   * @returns {Object} Object containing high60m and percentBelow60mHigh
+   */
+  async calculate60mHighPrice(currentPrice) {
+    try {
+      // Ensure we have a valid current price
+      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+        throw new Error(`Invalid current price: ${currentPrice}`);
+      }
+      
+      let high60m = 0;
+      let percentBelow60mHigh = 0;
+      
+      // Use 1-minute candles for 60-minute high calculation
+      const sixtyMinuteCandles = (this.candles || []).slice(-60); // Last 60 minutes
+      
+      if (sixtyMinuteCandles.length < 30) { // Require at least 30 minutes of data
+        throw new Error('Insufficient data for 60m high calculation');
+      }
+      
+      const validCandles = sixtyMinuteCandles.filter(candle => 
+        candle && typeof candle.high === 'number' && !isNaN(candle.high) && candle.high > 0
+      );
+      
+      if (validCandles.length === 0) {
+        throw new Error('No valid candles found for 60m high calculation');
+      }
+      
+      // Find the highest high in the last 60 minutes
+      high60m = Math.max(...validCandles.map(candle => candle.high));
+      
+      // Ensure we have a valid high60m before proceeding
+      if (typeof high60m !== 'number' || isNaN(high60m) || high60m <= 0) {
+        throw new Error(`Invalid 60m high value: ${high60m}`);
+      }
+      
+      // Calculate percentage below the 60m high
+      percentBelow60mHigh = ((high60m - currentPrice) / high60m) * 100;
+      
+      // Ensure we have a valid percentage
+      if (isNaN(percentBelow60mHigh) || !isFinite(percentBelow60mHigh)) {
+        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, high60m=${high60m}`);
+      }
+      
+      return {
+        high60m,
+        percentBelow60mHigh,
+        currentPrice
+      };
+      
+    } catch (error) {
+      logger.error(`Error in calculate60mHighPrice: ${error.message}`, { currentPrice });
+      return {
+        high60m: null,
+        percentBelow60mHigh: 0,
+        currentPrice: currentPrice || 0,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Calculates a blended score based on 24h average low and 60m high prices
+   * @param {number} currentPrice - The current price to evaluate
+   * @param {Object} low24hScore - The 24h low score object
+   * @param {Object} high60mInfo - The 60m high info object
+   * @returns {Object} Blended score and metadata
+   */
+  calculateBlendedScore(currentPrice, low24hScore, high60mInfo) {
+    try {
+      if (!low24hScore || !high60mInfo) {
+        throw new Error('Missing required score data');
+      }
+      
+      // Calculate 24h low score based on proximity to 24h low (0-10 points)
+      const percentAbove24hLow = low24hScore.percentAbove24hLow || 0;
+      let low24hPoints = 0;
+      
+      // New scoring system for 24h low proximity
+      if (percentAbove24hLow <= 5) {
+        low24hPoints = 10; // 0-5% above low: Excellent entry
+      } else if (percentAbove24hLow <= 10) {
+        low24hPoints = 8;  // 5-10% above low: Very good
+      } else if (percentAbove24hLow <= 15) {
+        low24hPoints = 6;  // 10-15% above low: Good
+      } else if (percentAbove24hLow <= 25) {
+        low24hPoints = 3;  // 15-25% above low: Fair
+      }
+      // >25% above low remains 0 points
+
+      // Calculate 60m high score (0-10 scale)
+      // Reward being closer to 60m high (0-10 points)
+      const percentBelow60mHigh = high60mInfo.percentBelow60mHigh || 0;
+      let high60mPoints = 0;
+      
+      if (percentBelow60mHigh <= 0.5) {
+        high60mPoints = 10;  // Within 0.5% of 60m high: Excellent
+      } else if (percentBelow60mHigh <= 1) {
+        high60mPoints = 8;   // 0.5-1% below: Very good
+      } else if (percentBelow60mHigh <= 2) {
+        high60mPoints = 6;   // 1-2% below: Good
+      } else if (percentBelow60mHigh <= 3) {
+        high60mPoints = 4;   // 2-3% below: Fair
+      } else if (percentBelow60mHigh <= 5) {
+        high60mPoints = 2;   // 3-5% below: Poor
+      }
+      // >5% below remains 0 points
+      
+      // Calculate blended score (60% 24h low, 40% 60m high)
+      const blendedScore = Math.round((low24hPoints * 0.6) + (high60mPoints * 0.4));
+      
+      // Add detailed reasoning for the scores
+      const reasons = [
+        '📊 Blended Score Breakdown:',
+        `- 24h Low: ${low24hPoints}/10 (${percentAbove24hLow.toFixed(2)}% above 24h low)`,
+        `- 60m High: ${high60mPoints}/10 (${percentBelow60mHigh.toFixed(2)}% below 60m high)`,
+        `- Final Score: ${blendedScore}/10 (60% 24h Low, 40% 60m High)`
+      ];
+      
+      // Add qualitative assessment
+      if (blendedScore >= 8) {
+        reasons.push('✅ Excellent buying opportunity - strong technical setup');
+      } else if (blendedScore >= 6) {
+        reasons.push('👍 Good buying opportunity - favorable conditions');
+      } else if (blendedScore >= 4) {
+        reasons.push('🤔 Fair buying opportunity - consider other factors');
+      } else {
+        reasons.push('⚠️ Poor buying opportunity - wait for better entry');
+      }
+      
+      return {
+        score: blendedScore,
+        low24hScore: low24hPoints,
+        high60mScore: high60mPoints,
+        percentBelow60mHigh: percentBelow60mHigh,
+        reasons: reasons
+      };
+      
+    } catch (error) {
+      logger.error(`Error in calculateBlendedScore: ${error.message}`, { currentPrice });
+      return {
+        score: 0,
+        low24hScore: 0,
+        high60mScore: 0,
+        percentBelow60mHigh: 0,
+        reasons: ['Error calculating blended score']
+      };
+    }
+  }
+
+  /**
    * Calculates the 12-hour high price and percentage above/below current price
    * @param {number} currentPrice - The current price to evaluate against
    * @returns {Object} Object containing high12h and percentBelow12hHigh
@@ -2478,6 +2630,21 @@ class SyrupTradingBot {
       };
     }
     
+    // Calculate 60-minute high price information
+    let high60mInfo;
+    try {
+      logger.debug(`Calculating 60m high price for price: ${currentPrice}`);
+      high60mInfo = await this.calculate60mHighPrice(currentPrice);
+    } catch (error) {
+      logger.error('Error calculating 60m high price:', error);
+      high60mInfo = {
+        high60m: null,
+        percentBelow60mHigh: 0,
+        currentPrice: currentPrice,
+        error: error.message
+      };
+    }
+    
     // Calculate 12h high price information
     let high12hInfo;
     try {
@@ -2493,9 +2660,12 @@ class SyrupTradingBot {
       };
     }
     
-    // Calculate total score (tech + dip + 24h low)
-    const maxPossibleScore = 21; // 8 (tech) + 3 (dip) + 10 (24h low)
-    const totalScore = Math.min(maxPossibleScore, techScore.score + dipScore.score + low24hScore.score);
+    // Calculate blended score (24h low + 60m high)
+    const blendedScore = this.calculateBlendedScore(currentPrice, low24hScore, high60mInfo);
+    
+    // Calculate total score (tech + dip + blended score)
+    const maxPossibleScore = 21; // 8 (tech) + 3 (dip) + 10 (blended)
+    const totalScore = Math.min(maxPossibleScore, techScore.score + dipScore.score + blendedScore.score);
     
     // Log the score calculation with detailed breakdown
     logger.debug('Buy signal score calculation', {
@@ -2510,13 +2680,17 @@ class SyrupTradingBot {
         max: 3,
         reasons: dipScore.reasons
       },
-      low24hScore: {
-        value: low24hScore.score,
-        max: 10,
-        low24h: low24hScore.low24h,
-        currentPrice: low24hScore.currentPrice,
-        percentAbove24hLow: low24hScore.percentAbove24hLow,
-        reasons: low24hScore.reasons
+      blendedScore: {
+        value: blendedScore.score,
+        low24hScore: blendedScore.low24hScore,
+        high60mScore: blendedScore.high60mScore,
+        percentBelow60mHigh: blendedScore.percentBelow60mHigh,
+        reasons: blendedScore.reasons
+      },
+      high60mInfo: {
+        high60m: high60mInfo.high60m,
+        percentBelow60mHigh: high60mInfo.percentBelow60mHigh,
+        currentPrice: high60mInfo.currentPrice
       },
       high24hInfo: {
         avgHigh24h: high24hInfo.avgHigh24h,
@@ -2524,7 +2698,7 @@ class SyrupTradingBot {
         currentPrice: high24hInfo.currentPrice
       },
       high12hInfo: {
-        avgHigh12h: high12hInfo.avgHigh12h,
+        high12h: high12hInfo.high12h,
         percentBelow12hHigh: high12hInfo.percentBelow12hHigh,
         currentPrice: high12hInfo.currentPrice
       },
@@ -2773,8 +2947,8 @@ class SyrupTradingBot {
     const isConfirmed = (confirmation.confirmed || hasEnoughConfirmations) && 
                       totalScore >= this.buyConfig.minScore;
     
-    // Debug log for confirmation status
-    if (isConfirmed) {
+    // Debug log for confirmation status - only log if not already confirmed
+    if (isConfirmed && !this.activeBuySignal.confirmationProcessed) {
       logger.debug('Confirmation check', {
         confirmed: confirmation.confirmed,
         hasEnoughConfirmations,
@@ -2785,32 +2959,25 @@ class SyrupTradingBot {
       });
     }
     
-    // If we don't have an active signal or required data, return early
-    if (!this.activeBuySignal.isActive || this.activeBuySignal.signalPrice === null || this.activeBuySignal.signalTime === null) {
-
-      const allReasons = [
-        `=== Buy Signal ===`,
-        `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${low24hScore.score}/10 (24h Low) = ${totalScore}/21`,
-        `⚪ Status: No active signal`,
-        `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
-        `24h High: ${this.formatHighPrice(high24hInfo)}`,
-        `12h High: ${this.formatHighPrice(high12hInfo, 12)}`,
-        '---',
-        ...techScore.reasons.filter(r => !r.includes('Score:')),
-        ...dipScore.reasons.filter(r => !r.includes('Score:')),
-        ...low24hScore.reasons.filter(r => !r.includes('Score:') && !r.includes('24h Low:')),
-        `Pending signals in queue: ${this.pendingBuySignals.length}`,
-        `===========================`
-      ].filter(Boolean);
-
-      return {
-        techScore: techScore.score,
-        dipScore: dipScore.score,
-        low24hScore: low24hScore.score,
-        totalScore: totalScore,
-        reasons: allReasons,
-        shouldBuy: false,
-        confirmed: false
+    // If we don't have an active signal or required data, skip to the output generation
+    const hasActiveSignal = this.activeBuySignal.isActive && 
+                          this.activeBuySignal.signalPrice !== null && 
+                          this.activeBuySignal.signalTime !== null;
+    
+    if (!hasActiveSignal) {
+      // Reset any existing active signal data
+      this.activeBuySignal = {
+        isActive: false,
+        signalPrice: null,
+        signalTime: null,
+        confirmations: 0,
+        lastConfirmationTime: null,
+        totalInvested: 0,
+        totalQuantity: 0,
+        averagePrice: 0,
+        buyCount: 0,
+        lastBuyPrice: 0,
+        orderIds: []
       };
     }
     
@@ -2835,8 +3002,8 @@ class SyrupTradingBot {
       this.activeBuySignal.confirmations = 2; // Ensure we have 2 confirmations
       this.activeBuySignal.lastConfirmationTime = currentTime;
       
-      // Log the confirmation
-      logger.info('2-candle buy signal confirmed, executing buy order', {
+      // Log the confirmation - this will be shown in the main signal output
+      logger.debug('2-candle buy signal confirmed, executing buy order', {
         price: this.activeBuySignal.signalPrice,
         currentPrice,
         confirmations: this.activeBuySignal.confirmations,
@@ -2858,32 +3025,67 @@ class SyrupTradingBot {
     const formattedHigh24h = this.formatHighPrice(high24hInfo);
     const formattedHigh12h = this.formatHighPrice(high12hInfo, 12);
     
-    // Add 24h and 12h high info to the reasons array
-    if (high24hInfo.avgHigh24h) {
-      techScore.reasons.push(`📈 24h High: ${formattedHigh24h}`);
-    }
-    if (high12hInfo.high12h) {
-      techScore.reasons.push(`⏳ 12h High: ${formattedHigh12h}`);
-    }
+    // Filter out any score-related reasons to avoid duplication
+    const filteredTechReasons = techScore.reasons.filter(r => 
+      !r.includes('Score:') && 
+      !r.includes('24h High:') && 
+      !r.includes('12h High:') &&
+      !r.includes('Low 24h:')
+    );
+    
+    const filteredDipReasons = dipScore.reasons.filter(r => 
+      !r.includes('Score:') && 
+      !r.includes('Price') && 
+      !r.includes('below') && 
+      !r.includes('high')
+    );
 
-    // Combine all reasons for logging
+    // Single source of truth for the buy signal output
     const allReasons = [
-      `=== Buy Signal ===`,
-      `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${low24hScore.score}/10 (24h Low) = ${totalScore}/21`,
+      '=== Buy Signal ===',
+      `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${blendedScore.score}/10 (Blended) = ${totalScore}/21`,
       `⚪ Status: ${isConfirmed ? '✅ Confirmed' : this.activeBuySignal.isActive ? '⏳ Pending' : 'No Signal'}`,
-      `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
-      `24h High: ${this.formatHighPrice(high24hInfo)}`,
       '---',
-      ...techScore.reasons.filter(r => !r.includes('Score:')),
-      ...dipScore.reasons.filter(r => !r.includes('Score:')),
-      ...low24hScore.reasons.filter(r => !r.includes('Score:') && !r.includes('24h Low:')),
+      `Blended Score: ${blendedScore.score}/10`,
+      `- 24h Low: ${blendedScore.low24hScore.toFixed(1)}/10 (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
+      `- 60m High: ${blendedScore.high60mScore.toFixed(1)}/10 (${high60mInfo.percentBelow60mHigh?.toFixed(2) || '0.00'}% below)`,
+      '---',
+      `24h Low: ${low24hScore.low24h?.toFixed(8) || 'N/A'}`,
+      `60m High: $${high60mInfo.high60m?.toFixed(8) || 'N/A'}`,
+      `24h High: ${formattedHigh24h}`,
+      '---',
+      ...filteredTechReasons,
+      ...filteredDipReasons,
+      ...low24hScore.reasons.filter(r => 
+        !r.includes('Score:') && 
+        !r.includes('24h Low:') && 
+        !r.includes('Current price is') &&
+        !r.includes('Low 24h:') &&
+        !r.includes('Current:')
+      ),
       this.activeBuySignal.isActive 
         ? `⏳ Signal active (${this.activeBuySignal.confirmations}/2 confirmations, ${((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2)}% from signal)`
         : 'No active signal',
-      isConfirmed ? '✅ 2-candle confirmation' : '',
+      isConfirmed ? '✅ 2-candle confirmation' : null,
       `Pending signals in queue: ${this.pendingBuySignals.length}`,
-      `===========================`
-    ].filter(Boolean); // Remove any empty strings
+      '==========================='
+    ].filter(Boolean); // Remove any null/undefined/empty strings
+    
+    // Log the buy signal if:
+    // 1. There's an active signal AND we haven't logged it yet this cycle, OR
+    // 2. The signal has just been confirmed
+    const isNewSignal = this.activeBuySignal.isActive && !this.activeBuySignal.lastSignalLogTime;
+    const shouldLogSignal = isNewSignal || isConfirmed;
+    
+    if (shouldLogSignal) {
+      const logMessage = allReasons.join('\n');
+      if (isConfirmed) {
+        logger.info(logMessage + '\n✅ Buy signal confirmed with score: ' + totalScore);
+      } else {
+        logger.info(logMessage);
+      }
+      this.activeBuySignal.lastSignalLogTime = currentTime;
+    }
 
     return {
       techScore: techScore.score,
@@ -3064,22 +3266,37 @@ class SyrupTradingBot {
     }).format(num) + (currency === 'USD' ? '' : ` ${currency}`);
   }
 
-  // Format high price for display (24h or 12h)
-  formatHighPrice(highInfo, hours = 24) {
+  // Format high price for display (60m, 12h, or 24h)
+  formatHighPrice(highInfo, timeframe = '24h') {
     try {
-      const highField = hours === 12 ? 'high12h' : 'avgHigh24h';
-      const percentField = hours === 12 ? 'percentBelow12hHigh' : 'percentBelow24hHigh';
+      let highField, percentField;
       
-      if (!highInfo[highField]) return 'N/A';
+      // Determine which fields to use based on timeframe
+      switch(timeframe) {
+        case '60m':
+          highField = 'high60m';
+          percentField = 'percentBelow60mHigh';
+          break;
+        case '12h':
+          highField = 'high12h';
+          percentField = 'percentBelow12hHigh';
+          break;
+        case '24h':
+        default:
+          highField = 'avgHigh24h';
+          percentField = 'percentBelow24hHigh';
+      }
       
-      const percentValue = highInfo[percentField];
+      if (!highInfo[highField] && highInfo[highField] !== 0) return 'N/A';
+      
+      const percentValue = highInfo[percentField] || 0;
       const percentText = percentValue >= 0 
         ? `${percentValue.toFixed(2)}% below`
         : `${Math.abs(percentValue).toFixed(2)}% above`;
         
-      return `$${highInfo[highField].toFixed(8)} (${percentText})`;
+      return `$${parseFloat(highInfo[highField]).toFixed(8)} (${percentText})`;
     } catch (error) {
-      logger.error('Error formatting high price:', { error, highInfo, hours });
+      logger.error('Error formatting high price:', { error, highInfo, timeframe });
       return 'N/A';
     }
   }
@@ -3182,22 +3399,8 @@ class SyrupTradingBot {
         statusText = 'Confirmed';
       }
       
-      // Filter out duplicate reasons that we're handling separately
-      const filteredReasons = buySignal.reasons.filter(r => 
-        !r.includes('2-candle confirmation') && 
-        !r.includes('Signal active') &&
-        !r.includes('Waiting for confirmation')
-      );
-      
-      const buySignalInfo = [
-        '=== Buy Signal ===',
-        `📊 Score: ${buySignal.techScore}/8 (Tech) + ${buySignal.dipScore}/3 (Dip) + ${buySignal.low24hScore}/10 (24h Low) = ${buySignal.totalScore}/21`,
-        `${statusEmoji} Status: ${statusText}`,
-        ...(buySignal.signalPrice ? [`Signal Price: ${this.formatPrice(buySignal.signalPrice)}`] : []),
-        ...(buySignal._24hLow ? [`24h Low: ${this.formatPrice(buySignal._24hLow)} (${buySignal.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`] : []),
-        ...(filteredReasons.length > 0 ? ['---', ...filteredReasons] : []),
-        ...(buySignal.confirmed ? ['✅ 2-candle confirmation'] : [])
-      ].filter(line => line).join('\n');
+      // Use the reasons array from the buy signal which already has the formatted output
+      const buySignalInfo = buySignal.reasons.join('\n');
       
       // Create log message
       const logMessage = [
@@ -3365,8 +3568,8 @@ class SyrupTradingBot {
       // Format the trading pair (e.g., 'SYRUP-USDC')
       const formattedTradingPair = this.tradingPair.replace('/', '-').toUpperCase();
       
-      // Calculate sell price with 4% profit target
-      const sellPrice = parseFloat((buyPrice * 1.04).toFixed(4));
+      // Calculate sell price with 3% profit target
+      const sellPrice = parseFloat((buyPrice * 1.03).toFixed(3));
       
       // Format amount to 1 decimal place for SYRUP
       const formattedAmount = parseFloat(amount.toFixed(1));

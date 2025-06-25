@@ -1,30 +1,27 @@
 // Trailing stop configuration
 export const trailingStopConfig = {
-  // Trailing settings
-  trailingStepPct: 0.3,             // 0.3% trailing step
-  minPriceDiffToUpdate: 0.5,         // 0.5% price difference required to update order
-  minProfitPct: 4.0,                // Minimum 4% profit target
-  maxLimitMultiplier: 1.25,         // Max 125% of entry price
+  // Core trailing settings
+  initialTargetPct: 2.5,            // Initial 2.5% target
+  trailTriggerPct: 1.0,             // Start trailing when 1% above target
+  trailStepPct: 0.2,                // Trail in 0.2% increments
+  maxTrailPct: 5.0,                 // Max 5% target (double initial)
+  minHoldTimeMs: 300000,            // 5min minimum hold before trailing
+  
+  // Exit strategy configuration
+  maxDrawdownPct: 1.5,              // Stop trailing if price drops 1.5% from high
+  maxTrailDurationMs: 1800000,      // Stop trailing after 30 minutes max
+  momentumExitThreshold: -0.3,      // Exit if momentum score drops below -0.3
+  consecutiveDownMoves: 3,          // Exit after 3 consecutive price drops
+  volumeDropThreshold: 0.4,         // Exit if volume drops 40% from trail start
   
   // Order management
-  orderCheckIntervalMs: 30000,       // Check orders every 30 seconds to prevent rate limiting
-  priceUpdateIntervalMs: 1000,       // Update prices every second
+  orderCheckIntervalMs: 30000,      // Check orders every 30 seconds
+  updateCooldownMs: 30000,          // 30s between order updates
+  maxConsecutiveTrails: 20,         // Maximum number of times to trail an order
   
-  // Technical analysis periods (for future use)
-  macdFast: 12,
-  macdSlow: 26,
-  macdSignal: 9,
-  rsiPeriod: 14,
-  bbPeriod: 20,
-  bbStdDev: 2,
-  volumePeriod: 20,
-  recentHighsPeriod: 10,
-  
-  // Risk management
-  maxConsecutiveTrails: 20,          // Maximum number of times to trail an order
-  cooldownPeriodMs: 30000,           // 30 sec cooldown after trail
-  momentumThreshold: 0.5,            // Minimum momentum score (0-1) required to trail
-  minProfitPercent: 1.0,             // Minimum profit percentage before trailing starts
+  // Technical analysis
+  volatilityThreshold: 0.5,         // When to be more/less aggressive
+  volatilityLookback: 20,           // Number of candles for volatility calculation
   
   // Logging
   enableDebugLogs: true,
@@ -33,7 +30,8 @@ export const trailingStopConfig = {
   // Order settings
   productId: 'SYRUP-USDC',
   orderType: 'limit',
-  postOnly: true
+  postOnly: true,
+  timeInForce: 'GTC'               // Good-Til-Cancelled
 };
 
 export default trailingStopConfig;
