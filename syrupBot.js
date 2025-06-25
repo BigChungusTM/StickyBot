@@ -2102,9 +2102,174 @@ class SyrupTradingBot {
       };
     }
   }
-  
+
+  /**
+   * Calculates the 24-hour average high price and percentage above/below current price
+   * @param {number} currentPrice - The current price to evaluate against
+   * @returns {Object} Object containing avgHigh24h and percentBelow24hHigh
+   */
+  async calculate24hHighPrice(currentPrice) {
+    try {
+      // Ensure we have a valid current price
+      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+        throw new Error(`Invalid current price: ${currentPrice}`);
+      }
+      
+      let avgHigh24h = 0;
+      let percentBelow24hHigh = 0;
+      
+      // Ensure we have enough data
+      if (!this.hourlyCandles || this.hourlyCandles.length < 24) {
+        // Fallback to 1-minute candles if we don't have hourly data yet
+        logger.warn('No hourly candles available, falling back to 1-minute candles for 24h high');
+        const dailyCandles = (this.candles || []).slice(-1440);
+        
+        if (dailyCandles.length < 60) {
+          throw new Error('Insufficient data for 24h average high calculation');
+        }
+        
+        const validDailyCandles = dailyCandles.filter(candle => 
+          candle && typeof candle.high === 'number' && !isNaN(candle.high) && candle.high > 0
+        );
+        
+        if (validDailyCandles.length === 0) {
+          throw new Error('No valid daily candles found for 24h average high calculation');
+        }
+        
+        // Calculate average of all daily highs as fallback
+        const sum = validDailyCandles.reduce((sum, candle) => sum + candle.high, 0);
+        avgHigh24h = sum / validDailyCandles.length;
+      } else {
+        // Use hourly candles for 24h average high calculation
+        const validHourlyCandles = this.hourlyCandles
+          .slice(-24) // Only use the last 24 hours
+          .filter(candle => 
+            candle && typeof candle.high === 'number' && !isNaN(candle.high) && candle.high > 0
+          );
+        
+        if (validHourlyCandles.length === 0) {
+          throw new Error('No valid hourly candles found for 24h average high calculation');
+        }
+        
+        // Calculate the average of the last 24 hourly highs
+        const sum = validHourlyCandles.reduce((sum, candle) => sum + candle.high, 0);
+        avgHigh24h = sum / validHourlyCandles.length;
+      }
+      
+      // Ensure we have a valid avgHigh24h before proceeding
+      if (typeof avgHigh24h !== 'number' || isNaN(avgHigh24h) || avgHigh24h <= 0) {
+        throw new Error(`Invalid 24h average high value: ${avgHigh24h}`);
+      }
+      
+      // Calculate percentage below the 24h average high
+      percentBelow24hHigh = ((avgHigh24h - currentPrice) / avgHigh24h) * 100;
+      
+      // Ensure we have a valid percentage
+      if (isNaN(percentBelow24hHigh) || !isFinite(percentBelow24hHigh)) {
+        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, avgHigh24h=${avgHigh24h}`);
+      }
+      
+      return {
+        avgHigh24h,
+        percentBelow24hHigh,
+        currentPrice
+      };
+      
+    } catch (error) {
+      logger.error(`Error in calculate24hHighPrice: ${error.message}`, { currentPrice });
+      return {
+        avgHigh24h: null,
+        percentBelow24hHigh: 0,
+        currentPrice: currentPrice || 0,
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Calculates the 12-hour high price and percentage above/below current price
+   * @param {number} currentPrice - The current price to evaluate against
+   * @returns {Object} Object containing high12h and percentBelow12hHigh
+   */
+  async calculate12hHighPrice(currentPrice) {
+    try {
+      // Ensure we have a valid current price
+      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+        throw new Error(`Invalid current price: ${currentPrice}`);
+      }
+      
+      let high12h = 0;
+      let percentBelow12hHigh = 0;
+      
+      // Ensure we have enough data
+      if (!this.hourlyCandles || this.hourlyCandles.length < 12) {
+        // Fallback to 1-minute candles if we don't have enough hourly data yet
+        logger.warn('Not enough hourly candles available, falling back to 1-minute candles for 12h high');
+        const halfDayCandles = (this.candles || []).slice(-720); // 12 hours of 1-minute candles
+        
+        if (halfDayCandles.length < 360) { // At least 6 hours of data
+          throw new Error('Insufficient data for 12h high calculation');
+        }
+        
+        const validHalfDayCandles = halfDayCandles.filter(candle => 
+          candle && typeof candle.high === 'number' && !isNaN(candle.high) && candle.high > 0
+        );
+        
+        if (validHalfDayCandles.length === 0) {
+          throw new Error('No valid candles found for 12h high calculation');
+        }
+        
+        // Find the highest high in the last 12 hours
+        high12h = Math.max(...validHalfDayCandles.map(candle => candle.high));
+      } else {
+        // Use hourly candles for 12h high calculation
+        const validHourlyCandles = this.hourlyCandles
+          .slice(-12) // Only use the last 12 hours
+          .filter(candle => 
+            candle && typeof candle.high === 'number' && !isNaN(candle.high) && candle.high > 0
+          );
+        
+        if (validHourlyCandles.length === 0) {
+          throw new Error('No valid hourly candles found for 12h high calculation');
+        }
+        
+        // Find the highest high in the last 12 hours
+        high12h = Math.max(...validHourlyCandles.map(candle => candle.high));
+      }
+      
+      // Ensure we have a valid high12h before proceeding
+      if (typeof high12h !== 'number' || isNaN(high12h) || high12h <= 0) {
+        throw new Error(`Invalid 12h high value: ${high12h}`);
+      }
+      
+      // Calculate percentage below the 12h high
+      percentBelow12hHigh = ((high12h - currentPrice) / high12h) * 100;
+      
+      // Ensure we have a valid percentage
+      if (isNaN(percentBelow12hHigh) || !isFinite(percentBelow12hHigh)) {
+        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, high12h=${high12h}`);
+      }
+      
+      return {
+        high12h,
+        percentBelow12hHigh,
+        currentPrice
+      };
+      
+    } catch (error) {
+      logger.error(`Error in calculate12hHighPrice: ${error.message}`, { currentPrice });
+      return {
+        high12h: null,
+        percentBelow12hHigh: 0,
+        currentPrice: currentPrice || 0,
+        error: error.message
+      };
+    }
+  }
+
   // Helper method to calculate the score from pre-computed values
   calculate24hLowScoreFromValues(low24h, currentPrice, percentAbove24hLow) {
+    // ... (rest of the code remains the same)
     try {
       // Input validation
       if (typeof low24h !== 'number' || isNaN(low24h) || low24h <= 0) {
@@ -2298,6 +2463,36 @@ class SyrupTradingBot {
       };
     }
     
+    // Calculate 24h high price information
+    let high24hInfo;
+    try {
+      logger.debug(`Calculating 24h high price for price: ${currentPrice}`);
+      high24hInfo = await this.calculate24hHighPrice(currentPrice);
+    } catch (error) {
+      logger.error('Error calculating 24h high price:', error);
+      high24hInfo = {
+        avgHigh24h: null,
+        percentBelow24hHigh: 0,
+        currentPrice: currentPrice,
+        error: error.message
+      };
+    }
+    
+    // Calculate 12h high price information
+    let high12hInfo;
+    try {
+      logger.debug(`Calculating 12h high price for price: ${currentPrice}`);
+      high12hInfo = await this.calculate12hHighPrice(currentPrice);
+    } catch (error) {
+      logger.error('Error calculating 12h high price:', error);
+      high12hInfo = {
+        high12h: null,
+        percentBelow12hHigh: 0,
+        currentPrice: currentPrice,
+        error: error.message
+      };
+    }
+    
     // Calculate total score (tech + dip + 24h low)
     const maxPossibleScore = 21; // 8 (tech) + 3 (dip) + 10 (24h low)
     const totalScore = Math.min(maxPossibleScore, techScore.score + dipScore.score + low24hScore.score);
@@ -2322,6 +2517,16 @@ class SyrupTradingBot {
         currentPrice: low24hScore.currentPrice,
         percentAbove24hLow: low24hScore.percentAbove24hLow,
         reasons: low24hScore.reasons
+      },
+      high24hInfo: {
+        avgHigh24h: high24hInfo.avgHigh24h,
+        percentBelow24hHigh: high24hInfo.percentBelow24hHigh,
+        currentPrice: high24hInfo.currentPrice
+      },
+      high12hInfo: {
+        avgHigh12h: high12hInfo.avgHigh12h,
+        percentBelow12hHigh: high12hInfo.percentBelow12hHigh,
+        currentPrice: high12hInfo.currentPrice
       },
       totalScore: {
         value: totalScore,
@@ -2453,6 +2658,15 @@ class SyrupTradingBot {
         techScore: techScore.score, // Individual component scores for reference
         dipScore: dipScore.score,
         low24hScore: low24hScore.score,
+        high24hInfo: {
+          avgHigh24h: parseFloat(high24hInfo.avgHigh24h?.toFixed(4) || 0),
+          percentBelow24hHigh: high24hInfo.percentBelow24hHigh
+        },
+        high12hInfo: {
+          high12h: parseFloat(high12hInfo.high12h?.toFixed(4) || 0),
+          percentBelow12hHigh: high12hInfo.percentBelow12hHigh,
+          currentPrice: parseFloat(high12hInfo.currentPrice?.toFixed(4) || 0)
+        },
         confirmations: this.activeBuySignal.isActive ? this.activeBuySignal.confirmations : 0,
         // Add a unique identifier for this signal
         id: `${currentTime.getTime()}-${currentPrice.toFixed(8)}`
@@ -2573,24 +2787,33 @@ class SyrupTradingBot {
     
     // If we don't have an active signal or required data, return early
     if (!this.activeBuySignal.isActive || this.activeBuySignal.signalPrice === null || this.activeBuySignal.signalTime === null) {
+
+      const allReasons = [
+        `=== Buy Signal ===`,
+        `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${low24hScore.score}/10 (24h Low) = ${totalScore}/21`,
+        `⚪ Status: No active signal`,
+        `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
+        `24h High: ${this.formatHighPrice(high24hInfo)}`,
+        `12h High: ${this.formatHighPrice(high12hInfo, 12)}`,
+        '---',
+        ...techScore.reasons.filter(r => !r.includes('Score:')),
+        ...dipScore.reasons.filter(r => !r.includes('Score:')),
+        ...low24hScore.reasons.filter(r => !r.includes('Score:') && !r.includes('24h Low:')),
+        `Pending signals in queue: ${this.pendingBuySignals.length}`,
+        `===========================`
+      ].filter(Boolean);
+
       return {
         techScore: techScore.score,
         dipScore: dipScore.score,
         low24hScore: low24hScore.score,
-        totalScore: parseFloat(totalScore.toFixed(1)),
-        confirmed: false,
-        signalStatus: 'inactive',
-        signalPrice: null,
-        confirmations: 0,
-        reasons: ['No active signal or missing signal data'],
-        _24hLow: low24hScore.low24h,
-        percentAbove24hLow: low24hScore.percentAbove24hLow,
-        pendingSignalsCount: this.pendingBuySignals.length
+        totalScore: totalScore,
+        reasons: allReasons,
+        shouldBuy: false,
+        confirmed: false
       };
     }
     
-    // Create confirmation key with active signal data
-    const confirmationKey = `${this.activeBuySignal.signalPrice.toFixed(8)}-${this.activeBuySignal.signalTime}`;
     const isNewConfirmation = isConfirmed && 
                             this.activeBuySignal.isActive && 
                             !this.processedConfirmations.has(confirmationKey);
@@ -2631,12 +2854,25 @@ class SyrupTradingBot {
       }
     }
     
+    // Format the 24h and 12h high prices for display
+    const formattedHigh24h = this.formatHighPrice(high24hInfo);
+    const formattedHigh12h = this.formatHighPrice(high12hInfo, 12);
+    
+    // Add 24h and 12h high info to the reasons array
+    if (high24hInfo.avgHigh24h) {
+      techScore.reasons.push(`📈 24h High: ${formattedHigh24h}`);
+    }
+    if (high12hInfo.high12h) {
+      techScore.reasons.push(`⏳ 12h High: ${formattedHigh12h}`);
+    }
+
     // Combine all reasons for logging
     const allReasons = [
       `=== Buy Signal ===`,
       `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${low24hScore.score}/10 (24h Low) = ${totalScore}/21`,
       `⚪ Status: ${isConfirmed ? '✅ Confirmed' : this.activeBuySignal.isActive ? '⏳ Pending' : 'No Signal'}`,
       `24h Low: $${low24hScore.low24h?.toFixed(8) || 'N/A'} (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
+      `24h High: ${this.formatHighPrice(high24hInfo)}`,
       '---',
       ...techScore.reasons.filter(r => !r.includes('Score:')),
       ...dipScore.reasons.filter(r => !r.includes('Score:')),
@@ -2814,9 +3050,9 @@ class SyrupTradingBot {
     if (currency === 'USDC' || currency === 'USD') {
       // USDC: 4 decimal places for consistency with Coinbase
       return num.toFixed(4);
-    } else if (currency === 'SYRUP') {
-      // SYRUP: 1 decimal place as per requirements
-      return num.toFixed(1);
+    } else if (currency === 'SYRUP' || this.quoteCurrency === 'USDC') {
+      // SYRUP in USDC: 4 decimal places for consistency with USDC formatting
+      return num.toFixed(4);
     }
     
     // Default formatting for other currencies
@@ -2826,6 +3062,26 @@ class SyrupTradingBot {
       minimumFractionDigits: 2,
       maximumFractionDigits: 8
     }).format(num) + (currency === 'USD' ? '' : ` ${currency}`);
+  }
+
+  // Format high price for display (24h or 12h)
+  formatHighPrice(highInfo, hours = 24) {
+    try {
+      const highField = hours === 12 ? 'high12h' : 'avgHigh24h';
+      const percentField = hours === 12 ? 'percentBelow12hHigh' : 'percentBelow24hHigh';
+      
+      if (!highInfo[highField]) return 'N/A';
+      
+      const percentValue = highInfo[percentField];
+      const percentText = percentValue >= 0 
+        ? `${percentValue.toFixed(2)}% below`
+        : `${Math.abs(percentValue).toFixed(2)}% above`;
+        
+      return `$${highInfo[highField].toFixed(8)} (${percentText})`;
+    } catch (error) {
+      logger.error('Error formatting high price:', { error, highInfo, hours });
+      return 'N/A';
+    }
   }
 
   formatTimestamp(timestamp) {
