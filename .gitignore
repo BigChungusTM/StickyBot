@@ -105,3 +105,4 @@ typings/
 # TernJS port file
 .tern-port
 candle_cache.json
+candle_cache.json.tmp

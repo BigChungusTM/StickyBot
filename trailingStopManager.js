@@ -5,7 +5,13 @@ class TrailingStopManager {
   constructor(coinbaseService, logger, configOverrides = {}) {
     this.coinbaseService = coinbaseService;
     this.logger = logger || console;
-    this.config = { ...config, ...configOverrides };
+    this.config = { 
+      cooldownPeriodMs: 30000,  // 30 seconds default cooldown
+      minIncrementPct: 0.001,   // 0.1% default minimum increment
+      volatilitySensitivity: 0.5, // How much to adjust for volatility (0-1)
+      ...config, 
+      ...configOverrides 
+    };
     
     // Rate limiting state
     this.rateLimits = {
@@ -449,15 +455,7 @@ class TrailingStopManager {
                 return;
               }
               
-              const type = (order.type || 'UNKNOWN').toUpperCase();
-              const side = (order.side || 'UNKNOWN').toUpperCase();
-              const key = `${side}_${type}`;
-              
-              if (!orderGroups[key]) {
-                orderGroups[key] = [];
-              }
-              
-              // Extract order details from either root or nested order object
+              // Extract order details from either root or nested order object for Advanced Trade API
               const orderObj = order.order || order;
               const orderId = orderObj.id || orderObj.order_id;
               
@@ -466,10 +464,43 @@ class TrailingStopManager {
                 return;
               }
               
-              // Add the ID to the root object if it's not there
-              if (!order.id) order.id = orderId;
+              // Extract order configuration for Advanced Trade API
+              const orderConfig = orderObj.order_configuration?.limit_limit_gtc || {};
               
-              orderGroups[key].push(order);
+              // Determine order type and side
+              const type = orderObj.order_type || 'UNKNOWN';
+              const side = orderObj.side || 'UNKNOWN';
+              const status = orderObj.status || 'UNKNOWN';
+              
+              // Format the order for consistent internal use
+              const formattedOrder = {
+                id: orderId,
+                order_id: orderId, // Add both id and order_id for compatibility
+                type: type,
+                side: side,
+                status: status,
+                price: parseFloat(orderConfig.limit_price || '0'),
+                size: parseFloat(orderConfig.base_size || '0'),
+                filled: 0, // Will be updated from orderObj.filled_size if available
+                remaining: parseFloat(orderConfig.base_size || '0'), // Will be updated if filled_size is available
+                created_at: orderObj.created_time || new Date().toISOString(),
+                // Include the full order object for reference
+                _raw: orderObj
+              };
+              
+              // Update filled and remaining quantities if available
+              if (orderObj.filled_size !== undefined) {
+                formattedOrder.filled = parseFloat(orderObj.filled_size);
+                formattedOrder.remaining = Math.max(0, formattedOrder.size - formattedOrder.filled);
+              }
+              
+              // Group by type and side for display
+              const key = `${side}_${type}`;
+              if (!orderGroups[key]) {
+                orderGroups[key] = [];
+              }
+              
+              orderGroups[key].push(formattedOrder);
               validOrders++;
               
             } catch (error) {
@@ -625,16 +656,26 @@ class TrailingStopManager {
         return true;
       });
       
-      // If no active sell limit orders, clear tracking state
-      if (sellLimitOrders.length === 0 && this.activeOrderId) {
-        this.logger.info(`No active sell limit orders found, clearing tracked order ${this.activeOrderId}`);
-        this.activeOrderId = null;
-        this.initialLimitPrice = 0;
-        this.currentLimitPrice = 0;
-        this.positionSize = 0;
-        this.entryPrice = 0;
-        this.consecutiveTrails = 0;
-        this.lastTrailTime = 0;
+      // If we have an active order but it's not in the list of sell limit orders, clear tracking state
+      if (this.activeOrderId) {
+        const activeOrderStillExists = sellLimitOrders.some(order => {
+          const orderObj = order.order || order;
+          const orderId = orderObj.order_id || orderObj.id;
+          return orderId === this.activeOrderId;
+        });
+        
+        if (!activeOrderStillExists) {
+          this.logger.info(`Tracked order ${this.activeOrderId} no longer exists in active orders, clearing state`);
+          this.activeOrderId = null;
+          this.initialLimitPrice = 0;
+          this.currentLimitPrice = 0;
+          this.positionSize = 0;
+          this.entryPrice = 0;
+          this.consecutiveTrails = 0;
+          this.lastTrailTime = 0;
+        } else {
+          this.logger.debug(`Tracked order ${this.activeOrderId} is still active`);
+        }
       }
       
       this.logger.info(`\n=== [TRAILING STOP] ACTIVE SELL LIMIT ORDERS ===`);
@@ -679,11 +720,23 @@ class TrailingStopManager {
       // Process each sell limit order
       for (const order of sellLimitOrders) {
         try {
-          const orderId = order.id;
-          const orderPrice = parseFloat(order.price);
-          const orderSize = parseFloat(order.size);
-          const filledSize = parseFloat(order.filled || '0');
-          const remainingSize = parseFloat(order.remaining || '0');
+          // Handle both direct and nested order objects
+          const orderObj = order.order || order;
+          const orderId = orderObj.order_id || orderObj.id;
+          
+          if (!orderId) {
+            this.logger.warn('Skipping order with no ID:', order);
+            continue;
+          }
+          
+          // Extract order configuration for limit orders
+          const orderConfig = orderObj.order_configuration?.limit_limit_gtc || {};
+          
+          // Extract size and filled amount
+          const orderSize = parseFloat(orderConfig.base_size || orderObj.size || '0');
+          const filledSize = parseFloat(orderObj.filled_size || orderObj.filled || '0');
+          const remainingSize = orderSize - filledSize;
+          const orderPrice = parseFloat(orderConfig.limit_price || orderObj.limit_price || '0');
           
           // Skip if order is already being tracked
           if (this.activeOrderId === orderId) {
@@ -705,7 +758,7 @@ class TrailingStopManager {
             size: orderSize,
             filled: filledSize,
             remaining: remainingSize,
-            timeInForce: order.time_in_force
+            timeInForce: orderObj.time_in_force || 'GTC'
           });
           
           // Only track one order at a time
@@ -797,14 +850,44 @@ class TrailingStopManager {
         this.priceHistory.shift();
       }
       
+      // Ensure we have enough data points before updating indicators
+      const minDataPoints = 20; // Minimum required for most indicators
+      if (this.priceHistory.length < minDataPoints) {
+        this.logger.warn(`Not enough price history (${this.priceHistory.length}/${minDataPoints}) for indicators. Need more data...`);
+        return false;
+      }
+      
       // Update indicators with latest market data
       this.logger.debug('Updating technical indicators...');
-      await this.updateIndicators();
+      const indicatorsUpdated = await this.updateIndicators();
+      
+      if (!indicatorsUpdated) {
+        this.logger.warn('Failed to update indicators. Skipping this cycle.');
+        return false;
+      }
       
       // Calculate momentum score and details
       this.logger.debug('Calculating momentum score...');
       const momentumScore = await this.calculateMomentumScore();
       const scoreDetails = this.getMomentumScoreDetails ? await this.getMomentumScoreDetails() : {};
+      
+      // Log indicator values for debugging
+      this.logger.info('📊 INDICATOR VALUES', {
+        rsi: this.indicators.rsi?.toFixed(2) || 'N/A',
+        macd: this.indicators.macd ? {
+          histogram: this.indicators.macd.histogram?.toFixed(4) || 'N/A',
+          signal: this.indicators.macd.signal?.toFixed(4) || 'N/A',
+          value: this.indicators.macd.value?.toFixed(4) || 'N/A'
+        } : 'N/A',
+        bollingerBands: this.indicators.bollingerBands ? {
+          upper: this.indicators.bollingerBands.upper?.toFixed(4) || 'N/A',
+          middle: this.indicators.bollingerBands.middle?.toFixed(4) || 'N/A',
+          lower: this.indicators.bollingerBands.lower?.toFixed(4) || 'N/A',
+          bandwidth: this.indicators.bollingerBands.bandwidth?.toFixed(2) + '%' || 'N/A'
+        } : 'N/A',
+        momentumScore: (momentumScore * 100).toFixed(1) + '%',
+        momentumThreshold: (this.config.momentumThreshold * 100).toFixed(1) + '%'
+      });
       
       // Log detailed order info
       try {
@@ -924,26 +1007,54 @@ class TrailingStopManager {
    * @private
    */
   async updateIndicators() {
-    if (!this.priceHistory || this.priceHistory.length < 20) {
-      this.logger.debug('Not enough price history to update indicators');
-      return;
+    const minDataPoints = 20; // Minimum data points needed for most indicators
+    
+    if (!this.priceHistory || this.priceHistory.length < minDataPoints) {
+      this.logger.warn(`Not enough price history to update indicators. Have ${this.priceHistory?.length || 0}, need at least ${minDataPoints}`);
+      return false;
     }
 
     try {
+      this.logger.debug(`Updating indicators with ${this.priceHistory.length} price points...`);
+      
+      // Log sample of price history for debugging
+      const sampleSize = Math.min(5, this.priceHistory.length);
+      const sample = this.priceHistory.slice(-sampleSize);
+      this.logger.debug(`Price history sample (last ${sampleSize} points):`, sample);
+      
       // Calculate MACD
       this.indicators.macd = TechnicalIndicators.calculateMACD(this.priceHistory);
+      this.logger.debug('MACD calculated:', {
+        histogram: this.indicators.macd?.histogram?.toFixed(4),
+        signal: this.indicators.macd?.signal?.toFixed(4),
+        value: this.indicators.macd?.value?.toFixed(4)
+      });
       
       // Calculate RSI
       this.indicators.rsi = TechnicalIndicators.calculateRSI(this.priceHistory);
+      this.logger.debug(`RSI: ${this.indicators.rsi?.toFixed(2) || 'N/A'}`);
       
-      // Calculate Bollinger Bands if we have enough data
-      if (this.priceHistory.length >= 20) {
-        this.indicators.bollingerBands = TechnicalIndicators.calculateBollingerBands(this.priceHistory);
+      // Calculate Bollinger Bands
+      this.indicators.bollingerBands = TechnicalIndicators.calculateBollingerBands(this.priceHistory);
+      if (this.indicators.bollingerBands) {
+        this.logger.debug('Bollinger Bands:', {
+          upper: this.indicators.bollingerBands.upper?.toFixed(4),
+          middle: this.indicators.bollingerBands.middle?.toFixed(4),
+          lower: this.indicators.bollingerBands.lower?.toFixed(4),
+          bandwidth: this.indicators.bollingerBands.bandwidth?.toFixed(2) + '%'
+        });
       }
       
-      this.logger.debug('Indicators updated successfully');
+      this.logger.info('✅ Indicators updated successfully');
+      return true;
+      
     } catch (error) {
-      this.logger.error(`Error updating indicators: ${error.message}`, { error });
+      this.logger.error(`❌ Error updating indicators: ${error.message}`, {
+        error: error.stack,
+        priceHistoryLength: this.priceHistory?.length,
+        priceHistorySample: this.priceHistory?.slice(-5)
+      });
+      return false;
     }
   }
 
@@ -953,43 +1064,90 @@ class TrailingStopManager {
    */
   async calculateMomentumScore() {
     if (!this.indicators.macd || !this.indicators.rsi || !this.indicators.bollingerBands) {
-      this.logger.debug('Missing required indicators for momentum calculation');
+      this.logger.debug('[TRAILING STOP] Missing required indicators for momentum calculation');
       return 0;
     }
     
     let score = 0;
     const indicators = this.indicators;
+    const scoreBreakdown = {};
     
-    // MACD components (0-30 points)
-    if (indicators.macd.histogram > 0) {
-      // Scale MACD histogram score based on its relative size
-      const macdStrength = Math.min(1, Math.abs(indicators.macd.histogram) * 100);
-      score += 10 + (5 * macdStrength);
-    }
-    if (indicators.macd.trend === 'up') score += 10;
-    if (indicators.macd.bullishCross) score += 5;
-    
-    // RSI components (0-30 points)
-    // More dynamic RSI scoring that scales with the RSI value
-    if (indicators.rsi.value > 50) {
-      // Scale from 0 to 30 points as RSI goes from 50 to 80
-      const rsiScore = Math.min(30, (indicators.rsi.value - 50) * 1.5);
-      score += rsiScore;
-    }
-    
-    // Bollinger Bands (0-20 points)
-    if (indicators.bollingerBands.priceNearUpperBand) {
-      // Give more points the closer price is to the upper band
-      const bbScore = indicators.bollingerBands.percentB > 0.7 ? 15 : 10;
-      score += bbScore;
-    }
-    if (indicators.bollingerBands.expansion) score += 5;
-    
-    // Volume spike (0-20 points)
-    if (indicators.volumeSpike && indicators.volumeSpike.withPriceIncrease) {
-      // More aggressive scoring for volume spikes
-      score += indicators.volumeSpike.intensity === 'high' ? 20 : 
-              indicators.volumeSpike.intensity === 'medium' ? 15 : 8;
+    try {
+      // MACD components (0-35 points)
+      if (indicators.macd.histogram > 0) {
+        // More sensitive to positive histogram values
+        const macdStrength = Math.min(1, indicators.macd.histogram * 200); // Increased sensitivity
+        const macdPoints = 15 + (10 * macdStrength); // More weight on histogram
+        score += macdPoints;
+        scoreBreakdown.macdHistogram = macdPoints.toFixed(2);
+      }
+      
+      if (indicators.macd.trend === 'up') {
+        score += 15; // Increased from 10
+        scoreBreakdown.macdTrend = 15;
+      }
+      
+      if (indicators.macd.bullishCross) {
+        score += 5;
+        scoreBreakdown.macdCross = 5;
+      }
+      
+      // RSI components (0-40 points) - More weight on RSI
+      if (indicators.rsi > 50) {  // Changed from indicators.rsi.value to indicators.rsi
+        // More aggressive scaling - reaches max at 70 RSI instead of 80
+        const rsiScore = Math.min(40, (indicators.rsi - 50) * 2);
+        score += rsiScore;
+        scoreBreakdown.rsi = rsiScore.toFixed(2);
+      }
+      
+      // Bollinger Bands (0-25 points) - More weight on price position
+      if (indicators.bollingerBands.upper && this.priceHistory.length > 0) {
+        const currentPrice = this.priceHistory[this.priceHistory.length - 1];
+        const upperBand = indicators.bollingerBands.upper;
+        const lowerBand = indicators.bollingerBands.lower;
+        
+        // Calculate how close price is to upper band (0-1)
+        const distanceToUpper = (currentPrice - lowerBand) / (upperBand - lowerBand);
+        
+        // More points the closer price is to upper band
+        const bbScore = Math.min(25, distanceToUpper * 30); // Up to 25 points
+        score += bbScore;
+        scoreBreakdown.bbPosition = bbScore.toFixed(2);
+        
+        // Additional points if price is above middle band
+        if (currentPrice > indicators.bollingerBands.middle) {
+          score += 5;
+          scoreBreakdown.bbAboveMiddle = 5;
+        }
+      }
+      
+      // Volume spike (0-20 points) - Keep existing logic but add to breakdown
+      if (indicators.volumeSpike && indicators.volumeSpike.withPriceIncrease) {
+        const volumePoints = indicators.volumeSpike.intensity === 'high' ? 20 : 
+                          indicators.volumeSpike.intensity === 'medium' ? 15 : 8;
+        score += volumePoints;
+        scoreBreakdown.volumeSpike = volumePoints;
+      }
+      
+      // Log detailed score breakdown for debugging
+      this.logger.debug('[TRAILING STOP] Momentum score breakdown:', {
+        totalScore: score,
+        normalizedScore: (score / 100).toFixed(4),
+        ...scoreBreakdown,
+        indicators: {
+          rsi: indicators.rsi?.toFixed(2),
+          macdHistogram: indicators.macd?.histogram?.toFixed(6),
+          macdSignal: indicators.macd?.signal?.toFixed(6),
+          macdValue: indicators.macd?.value?.toFixed(6),
+          bbUpper: indicators.bollingerBands?.upper?.toFixed(6),
+          bbMiddle: indicators.bollingerBands?.middle?.toFixed(6),
+          bbLower: indicators.bollingerBands?.lower?.toFixed(6)
+        }
+      });
+      
+    } catch (error) {
+      this.logger.error('[TRAILING STOP] Error calculating momentum score:', error);
+      return 0;
     }
     
     // Recent highs (0-10 points)
@@ -1011,47 +1169,57 @@ class TrailingStopManager {
     try {
       // Check if we have an active order to trail
       if (!this.activeOrderId) {
-        this.logger.debug('No active order to trail');
+        this.logger.debug('[TRAILING STOP] No active order to trail');
         return false;
       }
       
-      // Check cooldown period
+      // Check cooldown period (default 30 seconds if not set)
+      const cooldownMs = this.config.cooldownPeriodMs || 30000;
       const timeSinceLastTrail = Date.now() - this.lastTrailTime;
-      if (timeSinceLastTrail < this.config.cooldownPeriodMs) {
-        this.logger.debug(`Cooldown active: ${timeSinceLastTrail}ms < ${this.config.cooldownPeriodMs}ms`);
+      if (timeSinceLastTrail < cooldownMs) {
+        const remainingCooldown = Math.ceil((cooldownMs - timeSinceLastTrail) / 1000);
+        this.logger.debug(`[TRAILING STOP] Cooldown active: ${remainingCooldown}s remaining`);
         return false;
       }
       
       // Check max consecutive trails
       if (this.consecutiveTrails >= this.config.maxConsecutiveTrails) {
-        this.logger.warn(`Max consecutive trails reached (${this.consecutiveTrails}/${this.config.maxConsecutiveTrails}), waiting for cooldown`);
+        this.logger.warn(`[TRAILING STOP] Max consecutive trails reached (${this.consecutiveTrails}/${this.config.maxConsecutiveTrails}), waiting for cooldown`);
         return false;
       }
       
       // Check if price is above current limit (already moved in our favor)
       if (currentPrice <= this.currentLimitPrice) {
-        this.logger.debug(`Current price ${currentPrice} not above current limit ${this.currentLimitPrice}`);
+        this.logger.debug(`[TRAILING STOP] Current price ${currentPrice} not above current limit ${this.currentLimitPrice}`);
+        return false;
+      }
+      
+      // Ensure we have valid indicators
+      if (!this.indicators || !this.indicators.rsi || !this.indicators.macd || !this.indicators.bollingerBands) {
+        this.logger.warn('[TRAILING STOP] Missing indicator data, cannot calculate momentum score');
         return false;
       }
       
       // Calculate momentum score
       const momentumScore = await this.calculateMomentumScore();
-      const scoreDetails = this.getMomentumScoreDetails ? await this.getMomentumScoreDetails() : {};
       
-      this.logger.debug('Trailing Stop - Momentum Analysis:', {
+      // Log detailed momentum analysis
+      this.logger.info('[TRAILING STOP] Momentum Analysis:', {
+        currentPrice: currentPrice.toFixed(8),
+        currentLimit: this.currentLimitPrice.toFixed(8),
         momentumScore: momentumScore.toFixed(4),
         momentumThreshold: this.config.momentumThreshold,
-        rsi: this.indicators.rsi,
-        macd: this.indicators.macd,
-        bollingerBands: this.indicators.bollingerBands,
-        volumeSpike: this.indicators.volumeSpike,
-        recentHighs: this.indicators.recentHighs,
-        scoreDetails: scoreDetails || 'N/A'
+        rsi: this.indicators.rsi?.toFixed(2) || 'N/A',
+        macdHistogram: this.indicators.macd?.histogram?.toFixed(6) || 'N/A',
+        macdSignal: this.indicators.macd?.signal?.toFixed(6) || 'N/A',
+        bbUpper: this.indicators.bollingerBands?.upper?.toFixed(6) || 'N/A',
+        bbLower: this.indicators.bollingerBands?.lower?.toFixed(6) || 'N/A',
+        priceAboveBBUpper: currentPrice > (this.indicators.bollingerBands?.upper || 0) ? 'YES' : 'NO'
       });
       
       // Check if momentum is strong enough
       if (momentumScore < this.config.momentumThreshold) {
-        this.logger.debug(`Insufficient momentum for trailing: ${momentumScore.toFixed(4)} < ${this.config.momentumThreshold}`);
+        this.logger.debug(`[TRAILING STOP] Insufficient momentum for trailing: ${momentumScore.toFixed(4)} < ${this.config.momentumThreshold}`);
         return false;
       }
       
@@ -1072,12 +1240,26 @@ class TrailingStopManager {
         return false;
       }
       
-      // Calculate minimum price increment (0.1% of current price)
-      const minIncrement = currentPrice * 0.001;
+      // Calculate minimum price increment (default 0.1% of current price, configurable)
+      const minIncrementPct = this.config.minIncrementPct || 0.001;
+      let minIncrement = currentPrice * minIncrementPct;
+      
+      // Adjust increment based on volatility (wider stops in volatile markets)
+      if (this.indicators.bollingerBands) {
+        const bbWidth = this.indicators.bollingerBands.upper - this.indicators.bollingerBands.lower;
+        const bbWidthPct = bbWidth / this.indicators.bollingerBands.middle;
+        
+        // Increase minimum increment by up to 2x in high volatility
+        const volatilityMultiplier = 1 + Math.min(1, bbWidthPct * 10);
+        minIncrement *= volatilityMultiplier;
+        
+        this.logger.debug(`Volatility adjustment: BB width ${(bbWidthPct * 100).toFixed(2)}% -> ${volatilityMultiplier.toFixed(2)}x increment`);
+      }
       
       // Ensure the price movement is significant enough to warrant an update
-      if (potentialNewLimit - this.currentLimitPrice < minIncrement) {
-        this.logger.debug(`Price change too small to update (${(potentialNewLimit - this.currentLimitPrice).toFixed(6)} < ${minIncrement.toFixed(6)})`);
+      const priceDifference = potentialNewLimit - this.currentLimitPrice;
+      if (priceDifference < minIncrement) {
+        this.logger.debug(`Price change too small to update (${priceDifference.toFixed(8)} < ${minIncrement.toFixed(8)})`);
         return false;
       }
       
@@ -1112,12 +1294,37 @@ class TrailingStopManager {
           return false;
         }
         
+        // Store the old order ID before attempting to cancel
+        const oldOrderId = this.activeOrderId;
+        
         // Cancel existing order if any
-        if (this.activeOrderId) {
-          this.logger.debug(`Cancelling existing order ${this.activeOrderId}`);
+        if (oldOrderId) {
+          this.logger.info(`🔄 Cancelling existing order ${oldOrderId} to update price from ${this.currentLimitPrice} to ${newLimitPrice}`);
           const cancelSuccess = await this.cancelCurrentOrder();
+          
           if (!cancelSuccess) {
-            throw new Error('Failed to cancel existing order');
+            // If cancellation fails, verify if the order still exists
+            try {
+              const orderStatus = await this.makeRateLimitedCall(
+                () => this.coinbaseService.getOrder(oldOrderId),
+                'getOrder',
+                1,
+                false
+              );
+              
+              if (orderStatus && orderStatus.status === 'open') {
+                throw new Error(`Failed to cancel order ${oldOrderId} and it's still open`);
+              } else {
+                // Order was already filled or doesn't exist
+                this.logger.info(`Order ${oldOrderId} was already filled or doesn't exist, proceeding with new order`);
+                this.activeOrderId = null; // Clear the order ID
+              }
+            } catch (error) {
+              this.logger.error(`Error verifying order ${oldOrderId} status:`, error);
+              throw new Error(`Failed to verify order status: ${error.message}`);
+            }
+          } else {
+            this.logger.info(`✅ Successfully cancelled order ${oldOrderId}`);
           }
         }
         
