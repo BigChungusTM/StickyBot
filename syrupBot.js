@@ -2402,6 +2402,62 @@ class SyrupTradingBot {
   }
 
   /**
+   * Calculates a blended score based on 24h low and 60m high prices
+   * @param {number} currentPrice - The current price to evaluate
+   * @returns {Promise<Object>} Object containing blended score and component scores
+   */
+  async calculateBlendedScore(currentPrice) {
+    try {
+      // Get 24h low score
+      const low24hScoreResult = await this.calculate24hLowScore(currentPrice);
+      const low24hScore = low24hScoreResult?.score || 0;
+      
+      // Get 60m high data
+      const high60mData = await this.calculate60mHighPrice(currentPrice);
+      let high60mScore = 0;
+      let percentBelow60mHigh = high60mData?.percentBelow60mHigh || 0;
+      
+      // Calculate 60m high score (0-10)
+      if (percentBelow60mHigh <= 1) {
+        high60mScore = 2;  // 2/10 if within 1% of 60m high
+      } else if (percentBelow60mHigh <= 3) {
+        high60mScore = 4;  // 4/10 if 1-3% below 60m high
+      } else if (percentBelow60mHigh <= 5) {
+        high60mScore = 7;  // 7/10 if 3-5% below 60m high
+      } else {
+        high60mScore = 10; // 10/10 if more than 5% below 60m high
+      }
+      
+      // Calculate blended score (60% low24h, 40% high60m)
+      const blendedScore = Math.round((low24hScore * 0.6) + (high60mScore * 0.4));
+      
+      return {
+        score: blendedScore,
+        low24hScore,
+        high60mScore,
+        percentBelow60mHigh,
+        reasons: [
+          `24h Low Score: ${low24hScore.toFixed(1)}/10`,
+          `60m High Score: ${high60mScore.toFixed(1)}/10 (${percentBelow60mHigh.toFixed(2)}% below 60m high)`,
+          `Blended Score: ${blendedScore}/10 (60% 24h Low, 40% 60m High)`
+        ],
+        timestamp: new Date().toISOString()
+      };
+      
+    } catch (error) {
+      logger.error(`Error in calculateBlendedScore: ${error.message}`, { currentPrice });
+      return {
+        score: 0,
+        low24hScore: 0,
+        high60mScore: 0,
+        percentBelow60mHigh: 0,
+        reasons: ['Error calculating blended score'],
+        timestamp: new Date().toISOString()
+      };
+    }
+  }
+  
+  /**
    * Calculates the 60-minute high price and percentage above/below current price
    * @param {number} currentPrice - The current price to evaluate against
    * @returns {Object} Object containing high60m and percentBelow60mHigh
@@ -2466,84 +2522,6 @@ class SyrupTradingBot {
   
   /**
    * Calculates a blended score based on 24h average low and 60m high prices
-   * @param {number} currentPrice - The current price to evaluate
-   * @param {Object} low24hScore - The 24h low score object
-   * @param {Object} high60mInfo - The 60m high info object
-   * @returns {Object} Blended score and metadata
-   */
-  calculateBlendedScore(currentPrice, low24hScore, high60mInfo) {
-    try {
-      if (!low24hScore || !high60mInfo) {
-        throw new Error('Missing required score data');
-      }
-      
-      // Calculate 24h low score based on proximity to 24h low (0-10 points)
-      const percentAbove24hLow = low24hScore.percentAbove24hLow || 0;
-      let low24hPoints = 0;
-      
-      // New scoring system for 24h low proximity
-      if (percentAbove24hLow <= 5) {
-        low24hPoints = 10; // 0-5% above low: Excellent entry
-      } else if (percentAbove24hLow <= 10) {
-        low24hPoints = 8;  // 5-10% above low: Very good
-      } else if (percentAbove24hLow <= 15) {
-        low24hPoints = 6;  // 10-15% above low: Good
-      } else if (percentAbove24hLow <= 25) {
-        low24hPoints = 3;  // 15-25% above low: Fair
-      }
-      // >25% above low remains 0 points
-
-      // Calculate 60m high score (0-10 scale)
-      // Reward being closer to 60m high (0-10 points)
-      const percentBelow60mHigh = high60mInfo.percentBelow60mHigh || 0;
-      let high60mPoints = 0;
-      
-      if (percentBelow60mHigh <= 0.5) {
-        high60mPoints = 10;  // Within 0.5% of 60m high: Excellent
-      } else if (percentBelow60mHigh <= 1) {
-        high60mPoints = 8;   // 0.5-1% below: Very good
-      } else if (percentBelow60mHigh <= 2) {
-        high60mPoints = 6;   // 1-2% below: Good
-      } else if (percentBelow60mHigh <= 3) {
-        high60mPoints = 4;   // 2-3% below: Fair
-      } else if (percentBelow60mHigh <= 5) {
-        high60mPoints = 2;   // 3-5% below: Poor
-      }
-      // >5% below remains 0 points
-      
-      // Calculate blended score (30% 24h low, 70% 60m high)
-      const blendedScore = Math.round((low24hPoints * 0.3) + (high60mPoints * 0.7));
-      
-      // Add detailed reasoning for the scores
-      const reasons = [
-        '📊 Blended Score Breakdown:',
-        `- 24h Low: ${low24hPoints}/10 (${percentAbove24hLow.toFixed(2)}% above 24h low)`,
-        `- 60m High: ${high60mPoints}/10 (${percentBelow60mHigh.toFixed(2)}% below 60m high)`,
-        `- Final Score: ${blendedScore}/10 (30% 24h Low, 70% 60m High)`
-      ];
-      
-      // Add qualitative assessment
-      if (blendedScore >= 8) {
-        reasons.push('✅ Excellent buying opportunity - strong technical setup');
-      } else if (blendedScore >= 6) {
-        reasons.push('👍 Good buying opportunity - favorable conditions');
-      } else if (blendedScore >= 4) {
-        reasons.push('🤔 Fair buying opportunity - consider other factors');
-      } else {
-        reasons.push('⚠️ Poor buying opportunity - wait for better entry');
-      }
-      
-      return {
-        score: blendedScore,
-        low24hScore: low24hPoints,
-        high60mScore: high60mPoints,
-        percentBelow60mHigh: percentBelow60mHigh,
-        reasons: reasons
-      };
-      
-    } catch (error) {
-      logger.error(`Error in calculateBlendedScore: ${error.message}`, { currentPrice });
-      return {
         score: 0,
         low24hScore: 0,
         high60mScore: 0,
