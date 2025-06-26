@@ -1598,8 +1598,13 @@ class SyrupTradingBot {
   calculateIndicators() {
     try {
       if (this.candles.length === 0) {
+        logger.warn('No candles available for indicator calculation');
         return;
       }
+      
+      // Log candle data for debugging
+      logger.debug(`Calculating indicators with ${this.candles.length} candles`);
+      logger.debug('Latest candle:', this.candles[this.candles.length - 1]);
       
       // Get the most recent candles (up to the maximum period needed by any indicator)
       const maxPeriod = Math.max(
@@ -1616,21 +1621,30 @@ class SyrupTradingBot {
       const highs = recentCandles.map(c => parseFloat(c.high));
       const lows = recentCandles.map(c => parseFloat(c.low));
       
+      logger.debug(`Using ${recentCandles.length} recent candles for calculations`);
+      logger.debug('Closes array:', closes);
+      
+      // Log input data for debugging
+      logger.debug(`Input data for indicators - Closes: ${closes.length} items, first: ${closes[0]}, last: ${closes[closes.length - 1]}`);
+      
       // Calculate EMA20
       const ema20 = EMA.calculate({
         values: closes,
         period: 20 // Fixed period for EMA20
       });
+      logger.debug(`EMA20 calculation - Input length: ${closes.length}, Result length: ${ema20.length}, Last value: ${ema20[ema20.length - 1]}`);
       
       // Calculate EMA50 and EMA200 for trend confirmation
       const ema50 = EMA.calculate({ values: closes, period: 50 });
       const ema200 = EMA.calculate({ values: closes, period: 200 });
+      logger.debug(`EMA50/200 calculation - EMA50 last: ${ema50[ema50.length - 1]}, EMA200 last: ${ema200[ema200.length - 1]}`);
       
       // Calculate RSI
       const rsi = RSI.calculate({
         values: closes,
         period: this.buyConfig.rsiPeriod || 14
       });
+      logger.debug(`RSI calculation - Input length: ${closes.length}, Result length: ${rsi.length}, Last value: ${rsi[rsi.length - 1]}`);
       
       // Calculate Stochastic
       const stoch = Stochastic.calculate({
@@ -1641,6 +1655,7 @@ class SyrupTradingBot {
         signalPeriod: this.buyConfig.stochDPeriod || 3,
         kPeriod: this.buyConfig.stochKPeriod || 3
       });
+      logger.debug(`Stochastic calculation - Result length: ${stoch.length}, Last K: ${stoch[stoch.length - 1]?.k}, Last D: ${stoch[stoch.length - 1]?.d}`);
       
       // Calculate Bollinger Bands
       const bb = BollingerBands.calculate({
@@ -1648,6 +1663,7 @@ class SyrupTradingBot {
         period: this.buyConfig.bbPeriod || 20,
         stdDev: this.buyConfig.bbStdDev || 2
       });
+      logger.debug(`Bollinger Bands calculation - Result length: ${bb.length}, Last values - Upper: ${bb[bb.length - 1]?.upper}, Middle: ${bb[bb.length - 1]?.middle}, Lower: ${bb[bb.length - 1]?.lower}`);
       
       // Calculate MACD with detailed output
       const macd = MACD.calculate({
@@ -1660,6 +1676,10 @@ class SyrupTradingBot {
         includeSignal: true,
         includeHistogram: true
       });
+      
+      // Log MACD calculation results
+      const debugMacd = macd[macd.length - 1] || {};
+      logger.debug(`MACD calculation - Result length: ${macd.length}, Last values - MACD: ${debugMacd.MACD}, Signal: ${debugMacd.signal}, Histogram: ${debugMacd.histogram}`);
       
       // Get the most recent close price as the current price
       const currentPrice = recentCandles.length > 0 ? 
@@ -1708,6 +1728,108 @@ class SyrupTradingBot {
     } catch (error) {
       logger.error('Error in calculateIndicators:', error);
       throw error;
+    }
+  }
+
+  // Calculate dip score optimized for 1-minute trading
+  calculateDipScore(currentPrice) {
+    let score = 0;
+    const reasons = [];
+    const metrics = {};
+    
+    try {
+      // 1. Get recent price lows for different timeframes (in minutes)
+      const fiveMinLow = this.getRecentLow(5);
+      const fifteenMinLow = this.getRecentLow(15);
+      const oneHourLow = this.getRecentLow(60);
+      
+      // 2. Calculate percentage above each low (safeguard against division by zero)
+      const pctAbove5m = fiveMinLow > 0 ? ((currentPrice - fiveMinLow) / fiveMinLow) * 100 : 0;
+      const pctAbove15m = fifteenMinLow > 0 ? ((currentPrice - fifteenMinLow) / fifteenMinLow) * 100 : 0;
+      const pctAbove1h = oneHourLow > 0 ? ((currentPrice - oneHourLow) / oneHourLow) * 100 : 0;
+      
+      // Store metrics for debugging
+      metrics.pctAbove5m = pctAbove5m;
+      metrics.pctAbove15m = pctAbove15m;
+      metrics.pctAbove1h = pctAbove1h;
+      
+      // 3. Calculate volume metrics (5-minute average)
+      const volume5mAvg = this.calculateVolumeAverage(5);
+      const currentVolume = this.candles[this.candles.length - 1]?.volume || 0;
+      const volumeRatio = volume5mAvg > 0 ? (currentVolume / volume5mAvg) : 1;
+      metrics.volumeRatio = volumeRatio;
+      
+      // 4. Score based on 5-minute low position (0-2 points)
+      if (pctAbove5m <= 0.05) {  // Within 0.05% of 5-min low
+        score += 2.0;
+        reasons.push('At 5-min low (strong dip)');
+      } else if (pctAbove5m <= 0.1) {
+        score += 1.5;
+        reasons.push('Near 5-min low (good dip)');
+      } else if (pctAbove5m <= 0.2) {
+        score += 0.5;
+        reasons.push('Approaching 5-min low');
+      }
+      
+      // 5. Score based on 15-minute low position (0-2 points)
+      if (pctAbove15m <= 0.1) {  // Within 0.1% of 15-min low
+        score += 2.0;
+        reasons.push('At 15-min low (strong dip)');
+      } else if (pctAbove15m <= 0.25) {
+        score += 1.0;
+        reasons.push('Near 15-min low');
+      } else if (pctAbove15m <= 0.5) {
+        score += 0.5;
+        reasons.push('Approaching 15-min low');
+      }
+      
+      // 6. Add volume spike bonus (0-1 point)
+      if (volumeRatio >= 2.0) {  // 200% of 5-min average
+        score += 1.0;
+        reasons.push('Strong volume spike (200%+)');
+      } else if (volumeRatio >= 1.5) {
+        score += 0.5;
+        reasons.push('Moderate volume increase (150%+)');
+      }
+      
+      // 7. Cap at 5 points (the max for dip score)
+      score = Math.min(5.0, score);
+      
+      logger.debug('Dip score calculation:', {
+        currentPrice,
+        fiveMinLow,
+        fifteenMinLow,
+        oneHourLow,
+        pctAbove5m,
+        pctAbove15m,
+        pctAbove1h,
+        volumeRatio,
+        score
+      });
+      
+    } catch (error) {
+      logger.error('Error in calculateDipScore:', error);
+      return { score: 0, reasons: ['Error calculating dip score'], metrics: {} };
+    }
+    
+    return {
+      score: parseFloat(score.toFixed(2)),
+      reasons,
+      metrics
+    };
+  }
+  
+  // Calculate volume average over specified number of minutes
+  calculateVolumeAverage(minutes) {
+    try {
+      const recentCandles = this.candles.slice(-minutes);
+      if (recentCandles.length === 0) return 0;
+      
+      const sum = recentCandles.reduce((acc, candle) => acc + parseFloat(candle.volume || 0), 0);
+      return sum / recentCandles.length;
+    } catch (error) {
+      logger.error('Error calculating volume average:', error);
+      return 0;
     }
   }
 
@@ -2756,7 +2878,7 @@ class SyrupTradingBot {
   // Evaluate buy signal based on all conditions with CEX-friendly logic
   async evaluateBuySignal(indicators) {
     if (!indicators || typeof indicators !== 'object') {
-      logger.error('Invalid indicators object in evaluateBuySignal:', indicators);
+      logger.error('Invalid indicators object in evaluateBuySignal');
       return {
         score: 0,
         reasons: ['Invalid indicators data'],
@@ -2766,7 +2888,7 @@ class SyrupTradingBot {
     
     const currentPrice = indicators.price;
     if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
-      logger.error('Invalid current price in evaluateBuySignal:', currentPrice);
+      logger.error('Invalid current price in evaluateBuySignal');
       return {
         score: 0,
         reasons: ['Invalid current price'],
@@ -2774,10 +2896,8 @@ class SyrupTradingBot {
       };
     }
     
-    const currentTime = new Date();
-    
     // Calculate VWAP-based metrics
-    const vwap = this.calculateVWAP(this.candles.slice(0, 100)); // Last 100 candles
+    const vwap = this.calculateVWAP(this.candles.slice(0, 100));
     const priceVsVwap = vwap > 0 ? (currentPrice - vwap) / vwap * 100 : 0;
     
     // Calculate volume spike
@@ -2785,21 +2905,20 @@ class SyrupTradingBot {
     const volumeSpike = this.calculateVolumeSpike(volumeHistory, indicators.volume || 0);
     
     // Analyze candle momentum
-    const momentum = this.analyzeCandleMomentum(this.candles.slice(0, 5)); // Last 5 candles
+    const momentum = this.analyzeCandleMomentum(this.candles.slice(0, 5));
     
-    // Calculate technical indicators score with CEX-friendly parameters
-    const techScore = this.calculateBuyScore(indicators);
+    // Calculate technical indicators score
+    const techScore = this.calculateBuyScore(indicators) || { score: 0 };
     
     // Calculate dip score based on 60m high
-    const dipScore = this.calculateDipScore(currentPrice);
+    const dipScore = this.calculateDipScore(currentPrice) || { score: 0 };
     
     // Get 24h low score
     let low24hScore;
     try {
-      logger.debug(`Calculating 24h low score for price: ${currentPrice}`);
       low24hScore = await this.calculate24hLowScore(currentPrice);
     } catch (error) {
-      logger.error('Error calculating 24h low score:', error);
+      logger.error('Error calculating 24h low score:', error.message);
       low24hScore = {
         score: 0,
         reasons: ['Error calculating 24h low score'],
@@ -2809,19 +2928,13 @@ class SyrupTradingBot {
       };
     }
     
-    // Calculate high60mInfo and blended score using the proper calculation method
+    // Calculate high60mInfo and blended score
     const high60mInfo = await this.calculate60mHighPrice(currentPrice);
-    const blendedScoreResult = this.calculateBlendedScore(currentPrice, low24hScore, high60mInfo);
-  
-    // Scale blended score to 0-3 points for final score (14.3% of total 21 points)
-    const blendedScoreValue = (blendedScoreResult.score / 10) * 3; // Convert 0-10 scale to 0-3 scale
+    const blendedScoreResult = this.calculateBlendedScore(currentPrice, low24hScore, high60mInfo) || { score: 0 };
+    
+    // Scale blended score to 0-3 points (14.3% of total 21 points)
+    const blendedScoreValue = Math.min(3, (blendedScoreResult.score / 10) * 3);
     const blendedScoreFormatted = parseFloat(blendedScoreValue.toFixed(2));
-  
-    // Log the blended score details
-    if (blendedScoreResult.reasons && blendedScoreResult.reasons.length > 0) {
-      logger.debug('Blended Score Calculation:');
-      blendedScoreResult.reasons.forEach(reason => logger.debug(`  ${reason}`));
-    }
     
     // Get 24h VWAP information
     let vwap24hInfo;
@@ -2846,7 +2959,7 @@ class SyrupTradingBot {
       };
     }
     
-    // CEX-specific buy conditions - more flexible for CEX trading
+    // Define buy conditions for CEX trading
     const buyConditions = {
       // RSI between 40-70 (wider range for CEX)
       rsiOk: indicators.rsi >= 40 && indicators.rsi <= 70,
@@ -2860,33 +2973,31 @@ class SyrupTradingBot {
                 currentPrice > indicators.ema20 * 0.99 && 
                 currentPrice < indicators.ema20 * 1.03,
       
-      // Price above VWAP (bullish) - more important for CEX
+      // Price above VWAP (bullish)
       aboveVWAP: vwap24hInfo.isAboveVWAP,
       
-      // Volume at least 30% above average (less strict)
+      // Volume at least 30% above average
       goodVolume: volumeSpike > 0.3,
       
       // Some positive momentum
       hasMomentum: momentum.score >= 1,
       
-      // Additional: Price not too extended from VWAP (avoiding overbought)
+      // Price not too extended from VWAP (avoiding overbought)
       notTooExtended: vwap24hInfo.isAboveVWAP ? 
                      vwap24hInfo.priceVsVwap24h < 25 : // Max 25% above VWAP
                      true
     };
     
-    // Calculate total score (0-21 scale)
-    let totalScore = 0;
+    // Calculate score components with proper weights for 21-point scale
     const reasons = [];
     
-    // Calculate score components with proper weights for 21-point scale
-    // Technical score: 0-10 points (47.6% of total)
-    const techScoreComponent = (techScore?.score || 0) * 1.0;  // 0-10 points
+    // 1. Technical Score: 0-8 points (38.1% of total)
+    const techScoreComponent = Math.min(8, (techScore?.score || 0) * 0.8); // Scale down from 10 to 8
     
-    // Dip score: 0-5 points (23.8% of total)
-    const dipScoreComponent = (dipScore?.score || 0) * 1.0;  // 0-5 points
+    // 2. Dip Score: 0-5 points (23.8% of total)
+    const dipScoreComponent = Math.min(5, dipScore?.score || 0);
     
-    // Conditions bonus: 0-3 points (14.3% of total)
+    // 3. Conditions Bonus: 0-4 points (19.0% of total)
     const conditionScores = [];
     if (buyConditions.rsiOk) {
       conditionScores.push(1);
@@ -2900,50 +3011,135 @@ class SyrupTradingBot {
       conditionScores.push(1);
       reasons.push('Price above 24h VWAP');
     }
-    const conditionsBonus = conditionScores.reduce((sum, score) => sum + score, 0);
+    // Add volume condition
+    if (buyConditions.goodVolume) {
+      conditionScores.push(1);
+      reasons.push('Volume above average');
+    }
+    const conditionsBonus = Math.min(4, conditionScores.reduce((sum, score) => sum + score, 0));
     
-    // Blended score is already calculated as 0-3 points (14.3% of total)
-    const blendedScoreComponent = Math.min(3, blendedScoreValue);
+    // 4. Blended Score: 0-4 points (19.0% of total)
+    const blendedScoreComponent = Math.min(4, blendedScoreValue * (4/3)); // Scale up from 3 to 4
     
     // Calculate total score (0-21 points)
-    totalScore = techScoreComponent + dipScoreComponent + conditionsBonus + blendedScoreComponent;
+    let totalScore = techScoreComponent + dipScoreComponent + conditionsBonus + blendedScoreComponent;
+    
+    // Validate score components sum correctly
+    const validateScores = (components) => {
+      const expectedTotal = 21;
+      const maxScores = components.reduce((sum, comp) => sum + comp.max, 0);
+      
+      if (Math.abs(maxScores - expectedTotal) > 0.01) {
+        logger.warn(`Score component max values sum to ${maxScores}, expected ${expectedTotal}`);
+        return false;
+      }
+      
+      const currentTotal = components.reduce((sum, comp) => sum + comp.value, 0);
+      if (Math.abs(currentTotal - totalScore) > 0.01) {
+        logger.warn(`Score component values sum to ${currentTotal}, but totalScore is ${totalScore}`);
+        return false;
+      }
+      
+      return true;
+    };
+    
+    // Run validation
+    const components = [
+      { name: 'Technical', value: techScoreComponent, max: 8 },
+      { name: 'Dip', value: dipScoreComponent, max: 5 },
+      { name: 'Conditions', value: conditionsBonus, max: 4 },
+      { name: 'Blended', value: blendedScoreComponent, max: 4 }
+    ];
+    
+    if (!validateScores(components)) {
+      logger.warn('Score validation failed - check component calculations');
+    }
     
     // Set buy threshold (55% of 21 = ~11.55, rounded to 12)
     const buyThreshold = Math.ceil(21 * 0.55); // 12 points
     const isBuySignal = totalScore >= buyThreshold;
+    
+    // Log score component details for debugging
+    logger.debug('Score Component Details:', {
+      techScoreComponent,
+      dipScoreComponent,
+      conditionsBonus,
+      blendedScoreComponent,
+      totalScore,
+      buyThreshold,
+      isBuySignal
+    });
 
-    // Format score with consistent decimal places
-    const formatScore = (value, max) => {
-      const score = parseFloat(value) || 0;
-      const percentage = (score / 21 * 100).toFixed(1);
-      return {
-        display: `${score.toFixed(2)}/${max}`,
-        percentage: `${percentage}%`
-      };
-    };
+    // Format score for consistent display
+    const formatScore = (value, max) => ({
+      display: `${parseFloat(value || 0).toFixed(2)}/${max}`,
+      percentage: `${((value / 21) * 100).toFixed(1)}%`
+    });
 
-    // Log detailed score breakdown in 21-point scale
+    // Log score breakdown in 21-point scale
+    const scoreComponents = [
+      { 
+        name: '1. Technical', 
+        value: techScoreComponent, 
+        max: 8,
+        description: 'Based on RSI, MACD, and other indicators'
+      },
+      { 
+        name: '2. Dip', 
+        value: dipScoreComponent, 
+        max: 5,
+        description: 'Based on recent price drops'
+      },
+      { 
+        name: '3. Conditions', 
+        value: conditionsBonus, 
+        max: 4,
+        description: 'Market conditions (RSI, MACD, VWAP, Volume)'
+      },
+      { 
+        name: '4. Blended', 
+        value: blendedScoreComponent, 
+        max: 4,
+        description: '24h low/60m high price analysis'
+      }
+    ];
+
     logger.info('\n=== 📊 BUY SIGNAL SCORE BREAKDOWN (0-21 scale) ===');
     
-    const techScoreDisplay = formatScore(techScoreComponent, 10);
-    const dipScoreDisplay = formatScore(dipScoreComponent, 5);
-    const conditionsDisplay = formatScore(conditionsBonus, 3);
-    const blendedDisplay = formatScore(blendedScoreComponent, 3);
-    const totalDisplay = formatScore(totalScore, 21);
-    const thresholdDisplay = formatScore(buyThreshold, 21);
+    // Log header
+    logger.info('Component         Score     Weight   Contribution');
+    logger.info('----------------------------------------------');
     
-    logger.info(`1. Technical Score:  ${techScoreDisplay.display.padEnd(10)} (${techScoreDisplay.percentage} of total)`);
-    logger.info(`2. Dip Score:        ${dipScoreDisplay.display.padEnd(10)} (${dipScoreDisplay.percentage} of total)`);
-    logger.info(`3. Conditions Bonus: ${conditionsDisplay.display.padEnd(10)} (${conditionsDisplay.percentage} of total)`);
-    logger.info(`4. Blended Score:    ${blendedDisplay.display.padEnd(10)} (${blendedDisplay.percentage} of total)`);
-    logger.info('-----------------------------------');
-    logger.info(`- TOTAL SCORE:       ${totalDisplay.display.padEnd(10)} (${totalDisplay.percentage})`);
-    logger.info(`- BUY THRESHOLD:     ${buyThreshold.toString().padEnd(10)} (${thresholdDisplay.percentage})`);
+    // Log each score component with detailed breakdown
+    scoreComponents.forEach(({ name, value, max, description }) => {
+      const weightPct = (max / 21 * 100).toFixed(1);
+      const contribution = (value / 21 * 100).toFixed(1);
+      logger.info(
+        `${name.padEnd(16)} ${value.toFixed(2).padStart(4)}/${max}` +
+        `  ${weightPct}%`.padStart(8) +
+        `  ${contribution}%`.padStart(12) +
+        `  ${description}`
+      );
+    });
+    
+    // Log total score and threshold
+    logger.info('----------------------------------------------');
+    logger.info(
+      `${'TOTAL SCORE'.padEnd(16)}` +
+      `${totalScore.toFixed(2).padStart(4)}/21` +
+      `${'100.0%'.padStart(14)}` +
+      `  ${isBuySignal ? '✅ BUY SIGNAL' : '❌ NO SIGNAL'}`
+    );
+    
+    // Log decision
+    logger.info('\n=== 📈 DECISION ===');
+    logger.info(`- BUY THRESHOLD:     ${buyThreshold} points (55% of 21)`);
+    logger.info(`- CURRENT SCORE:     ${totalScore.toFixed(2)}/21 (${(totalScore/21*100).toFixed(1)}%)`);
     logger.info(`- SIGNAL:            ${isBuySignal ? '✅ BUY' : '❌ NO SIGNAL'}`);
     logger.info('===================================\n');
     
     // Log detailed breakdown for debugging
-    logger.debug('Detailed Score Components:', {
+    logger.debug('Score Components:', {
       technicalScore: techScoreComponent,
       dipScore: dipScoreComponent,
       conditionsBonus: conditionsBonus,
@@ -2992,7 +3188,7 @@ class SyrupTradingBot {
       
       // Price and Score Summary
       const entryThreshold = this.buyConfig.minScore * 1.5;
-      const maxPossibleScore = 10; // Maximum possible score (adjust based on your scoring system)
+      const maxPossibleScore = 21; // Maximum possible score in the 21-point system
       
       logger.info(`🔹 Current Price: $${formatDecimal(currentPrice)}`);
       // Score Breakdown with consistent formatting
@@ -3004,16 +3200,16 @@ class SyrupTradingBot {
         percentage: `${((parseFloat(value) || 0) / 21 * 100).toFixed(1)}%`
       });
 
-      // Show technical score (47.6% weight)
-      const techDisplay = formatScore(techScoreComponent, 10);
+      // Show technical score (8/21 weight)
+      const techDisplay = formatScore(techScoreComponent, 8);
       logger.info(`- Technical Score: ${techDisplay.display.padEnd(10)} (${techDisplay.percentage} of total)`);
       
-      // Show dip score (23.8% weight)
+      // Show dip score (5/21 weight)
       const dipDisplay = formatScore(dipScoreComponent, 5);
       logger.info(`- Dip Score:       ${dipDisplay.display.padEnd(10)} (${dipDisplay.percentage} of total)`);
       
-      // Show blended score components (14.3% weight)
-      const blendedDisplay = formatScore(blendedScoreComponent, 3);
+      // Show blended score components (4/21 weight)
+      const blendedDisplay = formatScore(blendedScoreComponent, 4);
       logger.info(`- Blended Score:   ${blendedDisplay.display.padEnd(10)} (${blendedDisplay.percentage} of total)`);
       
       if (blendedScoreResult) {
@@ -3022,10 +3218,12 @@ class SyrupTradingBot {
         logger.info(`  • Blended:  ${formatDecimal(blendedScoreResult.score, 2)}/10`);
       }
       
-      // Show conditions bonus (14.3% weight)
-      if (conditionsBonus > 0) {
-        const conditionsDisplay = formatScore(conditionsBonus, 3);
-        logger.info(`- Conditions:     ${conditionsDisplay.display.padEnd(10)} (${conditionsDisplay.percentage} of total)`);
+      // Show conditions bonus (4/21 weight) only once
+      const conditionsDisplay = formatScore(conditionsBonus, 4);
+      logger.info(`- Conditions:      ${conditionsDisplay.display.padEnd(10)} (${conditionsDisplay.percentage} of total)`);
+      
+      // Log individual conditions if any
+      if (reasons.length > 0) {
         reasons.forEach(reason => logger.info(`  • ${reason}`));
       }
       
@@ -3034,16 +3232,41 @@ class SyrupTradingBot {
       const thresholdDisplay = formatScore(buyThreshold, 21);
       
       logger.info('\n🎯 SCORE SUMMARY:');
-      logger.info(`- Total Score:   ${totalDisplay.display.padEnd(10)} (${totalDisplay.percentage} of max)`);
-      logger.info(`- Buy Threshold: ${buyThreshold.toString().padEnd(10)} (${thresholdDisplay.percentage} of max)`);
+      logger.info(`- Total Score:   ${totalScore.toFixed(2)}/21    (${(totalScore/21*100).toFixed(1)}% of max)`);
+      logger.info(`- Buy Threshold: ${buyThreshold}         (${(buyThreshold/21*100).toFixed(1)}% of max)`);
       logger.info(`   Threshold: ${buyThreshold}/21 (${(buyThreshold/21*100).toFixed(1)}%)`);
       
       // Indicator Values
       logger.info('\n📈 INDICATORS:');
       logger.info(`- RSI: ${formatDecimal(indicators.rsi, 2)} ${indicators.rsi < 30 ? '🔴' : indicators.rsi > 70 ? '🟢' : '⚪'}`);
-      logger.info(`- EMA20: $${formatDecimal(indicators.ema20)} (${calculatePctDiff(currentPrice, indicators.ema20).toFixed(2)}%)`);
-      logger.info(`- VWAP24h: $${formatDecimal(vwap24hInfo.vwap24h)} (${formatDecimal(calculatePctDiff(currentPrice, vwap24hInfo.vwap24h), 2)}%)`);
-      logger.info(`- MACD Hist: ${formatDecimal(indicators.macdHistogram, 6)} ${indicators.macdHistogram > 0 ? '🟢' : '🔴'}`);
+      
+      // Show EMA20 with proper handling
+      const ema20Value = this.indicators && typeof this.indicators.ema20 === 'number' 
+        ? `$${formatDecimal(this.indicators.ema20)} (${calculatePctDiff(this.indicators.price, this.indicators.ema20).toFixed(2)}%)` 
+        : 'N/A';
+      logger.info(`- EMA20: ${ema20Value}`);
+      
+      // Show VWAP if it has a valid value
+      const vwapValue = vwap24hInfo?.vwap24h !== undefined && vwap24hInfo.vwap24h !== null
+        ? `$${formatDecimal(vwap24hInfo.vwap24h)} (${formatDecimal(calculatePctDiff(this.indicators.price, vwap24hInfo.vwap24h), 2)}%)` 
+        : 'N/A';
+      logger.info(`- VWAP24h: ${vwapValue}`);
+      
+      // Show MACD Histogram with proper null/undefined check
+      const macdHistogram = this.indicators?.macdHistogram;
+      const macdHistValue = (macdHistogram !== null && macdHistogram !== undefined)
+        ? `${formatDecimal(macdHistogram, 6)} ${macdHistogram > 0 ? '🟢' : '🔴'}` 
+        : 'N/A';
+      logger.info(`- MACD Hist: ${macdHistValue}`);
+      
+      // Debug log for indicators object
+      logger.debug('Indicators object:', {
+        ema20: this.indicators?.ema20,
+        macdHistogram: this.indicators?.macdHistogram,
+        rsi: this.indicators?.rsi,
+        price: this.indicators?.price,
+        currentPrice: currentPrice
+      });
       
       // Buy Conditions
       logger.info('\n✅ CONDITIONS MET:');
@@ -3166,8 +3389,8 @@ class SyrupTradingBot {
       const meetsThreshold = totalScore >= this.buyConfig.minScore;
       const entryThreshold = this.buyConfig.minScore * 1.5;
       
-      logger.info(`- Score: ${totalScore.toFixed(2)}/${entryThreshold.toFixed(2)}`);
-      logger.info(`- Status: ${meetsThreshold ? '✅ BUY SIGNAL' : '❌ BELOW THRESHOLD'}`);
+      logger.info(`- Score: ${totalScore.toFixed(2)}/21`);
+      logger.info(`- Status: ${isBuySignal ? '✅ BUY SIGNAL' : '❌ NO SIGNAL'}`);
       logger.info(`- Active Signal: ${this.activeBuySignal.isActive ? '✅ YES' : '❌ NO'}`);
       
       if (this.activeBuySignal.isActive) {
@@ -3520,87 +3743,17 @@ class SyrupTradingBot {
       `📈 +${priceChange.toFixed(8)} (+${priceChangePercent.toFixed(2)}%)` : 
       `📉 ${priceChange.toFixed(8)} (${priceChangePercent.toFixed(2)}%)`;
     
-    // Format the indicators
-    const ema20 = indicators.ema20 || 0;
-    const emaDiff = ((currentPrice - ema20) / ema20 * 100).toFixed(2);
-    const emaStr = ema20 ? `${ema20.toFixed(4)} (${currentPrice > ema20 ? 'ABOVE' : 'BELOW'} by ${Math.abs(emaDiff)}%)` : 'N/A';
-    
-    const rsiValue = indicators.rsi || 0;
-    const rsiStr = rsiValue ? `${rsiValue.toFixed(2)} ${rsiValue > 70 ? '🔴' : rsiValue < 30 ? '🟢' : '⚪'}` : 'N/A';
-    
-    const stochK = indicators.stochK || 0;
-    const stochD = indicators.stochD || 0;
-    const stochStr = stochK && stochD ? 
-      `${stochK.toFixed(1)} / ${stochD.toFixed(1)} ${stochK > 80 || stochD > 80 ? '🔴' : stochK < 20 || stochD < 20 ? '🟢' : '⚪'}` : 'N/A';
-    
-    const bb = indicators.bb || {};
-    const bbStr = bb.upper && bb.middle && bb.lower ? 
-      `${bb.upper.toFixed(4)} | ${bb.middle.toFixed(4)} | ${bb.lower.toFixed(4)}` : 'N/A';
-    
-    const macd = indicators.macd || {};
-    const macdStr = macd.MACD && macd.signal && macd.histogram ? 
-      `${macd.MACD.toFixed(6)} | Signal: ${macd.signal.toFixed(6)} | Hist: ${macd.histogram.toFixed(6)}` : 'N/A';
-    
-    // Format the buy signal output
+    // Create a minimal reasons array with just the essential information
     const allReasons = [
       `=== ${dateStr} | ${timeStr} ===`,
-      `📊 ${this.tradingPair} - |`,
-      `💵 Price: ${currentPrice.toFixed(4)} ${priceChangeStr}`,
-      `📈 High: ${indicators.high?.toFixed(4) || 'N/A'} | 📉 Low: ${indicators.low?.toFixed(4) || 'N/A'}`,
-      `📊 Volume: ${(indicators.volume || 0).toFixed(2)} ${this.baseCurrency}`,
-      '--- TECHNICAL INDICATORS ---',
-      `📈 EMA(20): ${emaStr}`,
-      `📊 RSI(14): ${rsiStr}`,
-      `📊 Stoch K/D(14): ${stochStr}`,
-      `📊 BB(20): ${bbStr}`,
-      `📊 MACD: ${macdStr}`,
-      '--- BUY SIGNAL ---',
-      '=== Buy Signal ===',
-      `📊 Score: ${techScore.score}/8 (Tech) + ${dipScore.score}/3 (Dip) + ${blendedScore.score}/10 (Blended) = ${totalScore}/21`,
-      `⚪ Status: ${isConfirmed ? '✅ Confirmed' : this.activeBuySignal.isActive ? '⏳ Pending' : 'No Signal'}`,
-      '---',
-      `Blended Score: ${blendedScore.score}/10`,
-      `- 24h Low: ${blendedScore.low24hScore.toFixed(1)}/10 (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above)`,
-      `- 60m High: ${blendedScore.high60mScore.toFixed(1)}/10 (${high60mInfo.percentBelow60mHigh?.toFixed(2) || '0.00'}% below)`,
-      '---',
-      `24h Low: ${low24hScore.low24h?.toFixed(8) || 'N/A'}`,
-      `60m High: $${high60mInfo.high60m?.toFixed(8) || 'N/A'}`,
-      `24h High: ${formattedHigh24h}`,
-      '---',
-      ...filteredTechReasons,
-      ...filteredDipReasons,
-      ...low24hScore.reasons.filter(r => 
-        !r.includes('Score:') && 
-        !r.includes('24h Low:') && 
-        !r.includes('Current price is') &&
-        !r.includes('Low 24h:') &&
-        !r.includes('Current:')
-      ),
+      `📊 ${this.tradingPair} - Buy Signal Evaluation`,
+      `💵 Price: ${currentPrice.toFixed(4)}`,
+      `📊 Total Score: ${totalScore}/21`,
+      `⚡ Status: ${isConfirmed ? '✅ Confirmed' : this.activeBuySignal.isActive ? '⏳ Pending' : 'No Signal'}`,
       this.activeBuySignal.isActive 
-        ? `⏳ Signal active (${this.activeBuySignal.confirmations}/2 confirmations, ${((currentPrice - this.activeBuySignal.signalPrice) / this.activeBuySignal.signalPrice * 100).toFixed(2)}% from signal)`
-        : 'No active signal',
-      isConfirmed ? '✅ 2-candle confirmation' : null,
-      `Pending signals in queue: ${this.pendingBuySignals.length}`,
-      '==========================='
-    ].filter(Boolean); // Remove any null/undefined/empty strings
-    
-    // Always log the buy signal to console for visibility
-    const logMessage = allReasons.join('\n');
-    
-    // Log to console directly for immediate visibility
-    console.log('\n' + '='.repeat(50));
-    console.log(logMessage);
-    if (isConfirmed) {
-      console.log('✅ Buy signal confirmed with score:', totalScore);
-    }
-    console.log('='.repeat(50) + '\n');
-    
-    // Also log through the logger for file output
-    if (isConfirmed) {
-      logger.info(logMessage + '\n✅ Buy signal confirmed with score: ' + totalScore);
-    } else {
-      logger.info(logMessage);
-    }
+        ? `⏳ Signal active (${this.activeBuySignal.confirmations}/2 confirmations)`
+        : 'No active signal'
+    ];
     
     // Update last log time
     this.activeBuySignal.lastSignalLogTime = currentTime;
@@ -3849,7 +4002,7 @@ class SyrupTradingBot {
     
     try {
       const latestCandle = this.candles[this.candles.length - 1];
-      const formatNumber = (value, decimals = 4) => 
+      let formatNum = (value, decimals = 4) => 
         typeof value === 'number' ? value.toFixed(decimals) : 'N/A';
       
       // Calculate price change since last candle if available
@@ -3920,21 +4073,15 @@ class SyrupTradingBot {
       // Use the reasons array from the buy signal which already has the formatted output
       const buySignalInfo = buySignal.reasons.join('\n');
       
-      // Create log message
+      // Create log message - simplified to only show the new scoring system output
       const logMessage = [
         `\n=== ${formattedTime} ===`,
         `📊 ${this.tradingPair} - ${candleTime.split(' ')[1]}`,
         `💵 Price: ${this.formatPrice(latestCandle.close, this.quoteCurrency)} ${priceChangeSymbol} ${priceChange} (${priceChangePercent}%)`,
         `📈 High: ${this.formatPrice(latestCandle.high, this.quoteCurrency)} | 📉 Low: ${this.formatPrice(latestCandle.low, this.quoteCurrency)}`,
-        `📊 Volume: ${formatNumber(latestCandle.volume, 2)} ${this.baseCurrency}`,
-        '--- TECHNICAL INDICATORS ---',
-        `📈 EMA(${config.indicators.ema.period}): ${this.formatPrice(emaValue, this.quoteCurrency)} (${priceVsEma} by ${Math.abs(emaDiffPercent)}%)`,
-        `📊 RSI(${config.indicators.rsi.period}): ${formatNumber(rsiValue, 2)} ${rsiValue > 70 ? '🔴' : rsiValue < 30 ? '🟢' : '⚪'}`,
-        `📊 Stoch K/D(${config.indicators.stoch.period}): ${formatNumber(stochK, 1)} / ${formatNumber(stochD, 1)} ${stochK > 80 || stochD > 80 ? '🔴' : stochK < 20 || stochD < 20 ? '🟢' : '⚪'}`,
-        `📊 BB(${config.indicators.bb.period}): ${this.formatPrice(bbUpper, this.quoteCurrency)} | ${this.formatPrice(bbMiddle, this.quoteCurrency)} | ${this.formatPrice(bbLower, this.quoteCurrency)}`,
-        `📊 MACD: ${formatNumber(macdLine, 6)} | Signal: ${formatNumber(macdSignal, 6)} | Hist: ${formatNumber(macdHist, 6)}`,
+        `📊 Volume: ${formatNum(latestCandle.volume, 2)} ${this.baseCurrency}`,
         '--- BUY SIGNAL ---',
-        buySignalInfo,  // Use the formatted buySignalInfo we created earlier
+        buySignalInfo,  // This already contains all the signal information
         '==========================='
       ].join('\n');
       
