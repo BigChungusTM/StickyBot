@@ -81,6 +81,61 @@ SyrupBot is an advanced automated cryptocurrency trading bot focused on the SYRU
 
 ## 📚 Documentation
 
+### 🎯 21-Point Scoring System
+
+SyrupBot uses a sophisticated 21-point scoring system to evaluate buy signals, combining multiple technical and fundamental factors:
+
+#### 1. Technical Score (0-10 points, 47.6% weight)
+- **RSI (2 points)**: 
+  - 2 points if RSI < 35
+  - 1 point if RSI < 45
+  - 0.5 points if RSI < 50
+- **MACD (2 points)**:
+  - 1 point if MACD histogram is positive
+  - 1 point if MACD line is above signal line
+- **Bollinger Bands (2 points)**:
+  - 1 point if price is below lower band
+  - 1 point if price is in lower 30% of bands
+- **EMA (2 points)**:
+  - 1 point if price > EMA20
+  - 1 point if EMA20 > EMA50
+- **Volume (2 points)**:
+  - 1 point if volume > 1.3x 20-period average
+  - 1 point if volume is increasing for 2+ periods
+
+#### 2. Dip Score (0-5 points, 23.8% weight)
+- **60-Minute High (0-5 points)**:
+  - 5 points: >4% below 60m high
+  - 4 points: 3-4% below
+  - 3 points: 2-3% below
+  - 2 points: 1-2% below
+  - 1 point: 0.5-1% below
+  - 0 points: <0.5% below
+
+#### 3. Blended Score (0-3 points, 14.3% weight)
+- **24h Low + 60m High Blend (0-3 points)**:
+  - 50/50 weighted average of 24h low and 60m high scores
+  - Scaled to 0-3 point range
+  - Example: (24h_low_score * 0.5) + (60m_high_score * 0.5) * 0.3
+
+#### 4. Conditions Bonus (0-3 points, 14.3% weight)
+- **CEX-Specific Conditions**:
+  - 1 point: RSI in optimal range (40-70)
+  - 1 point: MACD showing improvement
+  - 1 point: Price above 24h VWAP
+
+#### Buy Signal Threshold
+- **Minimum Score**: 12/21 points (55%) required for buy consideration
+- **Ideal Entry**: 15+ points for higher probability trades
+- **Max Score**: 21 points (all conditions met)
+
+### CEX Trading Suitability
+- **Market Hours**: Optimized for 24/7 CEX trading
+- **Liquidity**: Designed for liquid pairs with tight spreads
+- **Order Types**: Supports limit and market orders
+- **Fees**: Accounts for taker/maker fee structure
+- **Slippage**: Minimized through smart order routing
+
 For detailed documentation of all functions and their usage, see [COMMON_FUNCTIONS.md](common_functions.md).
 
 ## 🏗️ Core Components

@@ -1332,17 +1332,7 @@ class TrailingStopManager {
       
       // Filter for active sell limit orders
       this.logger.info('\n=== [TRAILING STOP] FILTERING FOR ACTIVE SELL LIMIT ORDERS ===');
-      
-      // Log all order fields for debugging
-      if (openOrders.length > 0) {
-        this.logger.info('=== RAW ORDER DATA ===');
-        openOrders.forEach((order, index) => {
-          this.logger.info(`\n[ORDER ${index + 1}/${openOrders.length}] ID: ${order.order_id || order.id || 'unknown'}`);
-          this.logger.info(JSON.stringify(order, null, 2));
-        });
-        this.logger.info('=== END RAW ORDER DATA ===\n');
-      }
-      
+            
       const sellLimitOrders = openOrders.filter(order => {
         // Handle both direct and nested order objects
         const orderObj = order.order || order;
