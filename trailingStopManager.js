@@ -1414,13 +1414,7 @@ class TrailingStopManager {
         
         if (!activeOrderStillExists) {
           this.logger.info(`Tracked order ${this.activeOrderId} no longer exists in active orders, clearing state`);
-          this.activeOrderId = null;
-          this.initialLimitPrice = 0;
-          this.currentLimitPrice = 0;
-          this.positionSize = 0;
-          this.entryPrice = 0;
-          this.consecutiveTrails = 0;
-          this.lastTrailTime = 0;
+          this.clearOrderState();
         } else {
           this.logger.debug(`Tracked order ${this.activeOrderId} is still active`);
         }
@@ -1527,16 +1521,39 @@ class TrailingStopManager {
           // Find our tracked order in the list of active orders
           const trackedOrder = sellLimitOrders.find(o => o.id === this.activeOrderId);
           
-          // If order is no longer active, clear tracking state
+          // If order is not found, don't immediately clear state - it might be a temporary API issue
           if (!trackedOrder) {
-            this.logger.info(`Tracked order ${this.activeOrderId} no longer exists, clearing state`);
-            this.activeOrderId = null;
-            this.initialLimitPrice = 0;
-            this.currentLimitPrice = 0;
-            this.positionSize = 0;
-            this.entryPrice = 0;
-            this.consecutiveTrails = 0;
-            this.lastTrailTime = 0;
+            // Only log a warning and keep the state for now
+            // We'll verify the order status directly in the next check
+            this.logger.warn(`Tracked order ${this.activeOrderId} not found in open orders list. Will verify status directly...`);
+            
+            try {
+              // Try to get the order directly to verify its status
+              const orderDetails = await this.makeRateLimitedCall(
+                () => this.coinbaseService.getOrder(this.activeOrderId),
+                'getOrder',
+                2, // Medium priority
+                false // Not critical
+              );
+              
+              if (!orderDetails) {
+                this.logger.warn(`Order ${this.activeOrderId} not found. It may have been filled or canceled.`);
+                this.clearOrderState();
+              } else {
+                const status = (orderDetails.status || '').toUpperCase();
+                if (['FILLED', 'CANCELLED', 'EXPIRED', 'REJECTED', 'DONE'].includes(status)) {
+                  this.logger.info(`Order ${this.activeOrderId} has status: ${status}. Clearing tracking state.`);
+                  this.clearOrderState();
+                } else {
+                  this.logger.info(`Order ${this.activeOrderId} is still active (status: ${status}). Keeping tracking state.`);
+                  // Update our local state with the latest order details
+                  this.updateOrderFromApiResponse(orderDetails);
+                }
+              }
+            } catch (error) {
+              this.logger.error(`Error verifying order ${this.activeOrderId} status:`, error.message);
+              // Don't clear state on error - we'll try again next time
+            }
             return;
           }
         } catch (error) {
@@ -2187,6 +2204,59 @@ class TrailingStopManager {
     }
   }
   
+  /**
+   * Clear all order tracking state
+   * @private
+   */
+  clearOrderState() {
+    this.logger.info(`Clearing order tracking state for order ${this.activeOrderId || 'none'}`);
+    this.activeOrderId = null;
+    this.initialLimitPrice = 0;
+    this.currentLimitPrice = 0;
+    this.positionSize = 0;
+    this.entryPrice = 0;
+    this.consecutiveTrails = 0;
+    this.lastTrailTime = 0;
+    
+    // Also clear any position tracking
+    if (this.position) {
+      this.position.status = 'inactive';
+      this.position.exitTime = new Date();
+      this.position.exitReason = 'order_cleared';
+    }
+  }
+  
+  /**
+   * Update local order state from API response
+   * @param {Object} orderResponse - The order response from the API
+   * @private
+   */
+  updateOrderFromApiResponse(orderResponse) {
+    if (!orderResponse) return;
+    
+    // Handle both direct and nested order objects
+    const order = orderResponse.order || orderResponse;
+    const orderConfig = order.order_configuration?.limit_limit_gtc || {};
+    
+    // Update our local state with the latest order details
+    this.activeOrderId = order.id || order.order_id || this.activeOrderId;
+    this.currentLimitPrice = parseFloat(orderConfig.limit_price || order.limit_price || this.currentLimitPrice);
+    
+    // Update position size if available
+    if (order.size) {
+      this.positionSize = parseFloat(order.size);
+    } else if (orderConfig.base_size) {
+      this.positionSize = parseFloat(orderConfig.base_size);
+    }
+    
+    // Log the update
+    this.logger.info(`Updated local order state for ${this.activeOrderId}:`, {
+      price: this.currentLimitPrice,
+      size: this.positionSize,
+      status: order.status || 'unknown'
+    });
+  }
+
   logStatus(currentPrice, additionalInfo = {}) {
     if (!this.activeTrailingStop) return;
     
