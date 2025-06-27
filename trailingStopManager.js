@@ -1413,13 +1413,50 @@ class TrailingStopManager {
         });
         
         if (!activeOrderStillExists) {
-          this.logger.info(`Tracked order ${this.activeOrderId} no longer exists in active orders, clearing state`);
-          this.clearOrderState();
+          this.logger.warn(`Tracked order ${this.activeOrderId} not found in open orders list. Will verify status directly...`);
+          
+          // Add direct order verification before clearing state
+          this.makeRateLimitedCall(
+            () => this.coinbaseService.getOrder(this.activeOrderId),
+            'getOrder',
+            2, // Medium priority
+            false // Not critical
+          ).then(orderDetails => {
+            if (!orderDetails) {
+              this.logger.warn(`Order ${this.activeOrderId} not found after direct verification. It may have been filled or canceled.`);
+              this.clearOrderState();
+            } else {
+              const status = (orderDetails.status || '').toUpperCase();
+              if (['FILLED', 'CANCELLED', 'EXPIRED', 'REJECTED', 'DONE'].includes(status)) {
+                this.logger.info(`Order ${this.activeOrderId} has status: ${status}. Clearing tracking state.`);
+                this.clearOrderState();
+              } else {
+                this.logger.info(`Order ${this.activeOrderId} is still active (status: ${status}). Keeping tracking state.`);
+                // The order is still active but wasn't in our list - could be pagination or API issue
+              }
+            }
+          }).catch(error => {
+            // Log the full error object for complete debugging
+            this.logger.error(`Error verifying order ${this.activeOrderId} status:`, {
+              message: error.message || 'Unknown error',
+              code: error.code || 'No code',
+              statusCode: error.statusCode || 'No status code',
+              name: error.name || 'No name',
+              stack: error.stack ? error.stack.split('\n').slice(0, 3).join('\n') : 'No stack trace',
+              errorType: typeof error,
+              errorJson: JSON.stringify(error, Object.getOwnPropertyNames(error), 2).substring(0, 500),
+              timestamp: new Date().toISOString()
+            });
+            
+            // Also log the raw error for complete visibility
+            console.error('Raw verification error:', error);
+            
+            // Don't clear state on error - we'll try again next time
+          });
         } else {
           this.logger.debug(`Tracked order ${this.activeOrderId} is still active`);
         }
       }
-      
       this.logger.info(`\n=== [TRAILING STOP] ACTIVE SELL LIMIT ORDERS ===`);
       this.logger.info(`Found ${sellLimitOrders.length} active sell limit orders`);
       

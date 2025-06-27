@@ -2765,25 +2765,25 @@ class SyrupTradingBot {
       const percentBelow60mHigh = high60mData.percentBelow60mHigh || 0;
       let high60mScore = 0;
       
-      // Calculate 60m high score (0-10 scale)
+      // Calculate 60m high score (0-10 scale) - More sensitive to smaller dips
       if (percentBelow60mHigh < 0) {
         high60mScore = 1;  // New high
-      } else if (percentBelow60mHigh <= 0.5) {
-        high60mScore = 2;  // Within 0.5% of high
-      } else if (percentBelow60mHigh <= 1.0) {
-        high60mScore = 3;  // 0.5-1% below
-      } else if (percentBelow60mHigh <= 1.5) {
-        high60mScore = 4;  // 1-1.5% below
-      } else if (percentBelow60mHigh <= 2.0) {
-        high60mScore = 5;  // 1.5-2% below
-      } else if (percentBelow60mHigh <= 2.5) {
-        high60mScore = 6;  // 2-2.5% below
-      } else if (percentBelow60mHigh <= 4.0) {
-        high60mScore = 8;  // 3-4% below
-      } else if (percentBelow60mHigh <= 5.0) {
-        high60mScore = 9;  // 4-5% below
+      } else if (percentBelow60mHigh <= 0.25) { // More sensitive (was 0.5)
+        high60mScore = 2;  // Within 0.25% of high
+      } else if (percentBelow60mHigh <= 0.75) { // More sensitive (was 1.0)
+        high60mScore = 3;  // 0.25-0.75% below
+      } else if (percentBelow60mHigh <= 1.25) { // More sensitive (was 1.5)
+        high60mScore = 4;  // 0.75-1.25% below
+      } else if (percentBelow60mHigh <= 1.75) { // More sensitive (was 2.0)
+        high60mScore = 5;  // 1.25-1.75% below
+      } else if (percentBelow60mHigh <= 2.25) { // More sensitive (was 2.5)
+        high60mScore = 6;  // 1.75-2.25% below
+      } else if (percentBelow60mHigh <= 3.0) { // More sensitive (was 4.0)
+        high60mScore = 8;  // 2.25-3% below
+      } else if (percentBelow60mHigh <= 4.0) { // More sensitive (was 5.0)
+        high60mScore = 9;  // 3-4% below
       } else {
-        high60mScore = 10; // More than 5% below
+        high60mScore = 10; // More than 4% below (was 5%)
       }
       
       // Ensure the score is within valid range (0-10)
@@ -4046,7 +4046,7 @@ class SyrupTradingBot {
     }
     
     // Set buy threshold (55% of 21 = ~11.55, rounded to 12)
-    const buyThreshold = Math.ceil(21 * 0.55); // 12 points
+    const buyThreshold = Math.ceil(21 * 0.47); // 10 points - adjusted for more responsive buying
     const isBuySignal = totalScore >= buyThreshold;
     
     // Log score component details for debugging
@@ -4314,9 +4314,10 @@ class SyrupTradingBot {
       };
     }
     
-    // For new signals, require a higher threshold
-    const entryThreshold = 6.5; // 6.5/10 for CEX (slightly more aggressive)
-    const meetsThreshold = totalScore >= entryThreshold;
+    // For new signals, require the standard threshold (12/21)
+    // We're using the same buyThreshold (12 points) that was defined earlier
+    // This ensures consistency in our buy signal evaluation
+    const meetsThreshold = totalScore >= buyThreshold; // Using the 12/21 threshold consistently
     
     // Calculate all price metrics needed for logging
     const high24hInfo = await this.calculate24hHighPrice(currentPrice);
@@ -4377,8 +4378,8 @@ class SyrupTradingBot {
       
       // Log evaluation status with more context
       logger.info('\n🔍 EVALUATION:');
-      const meetsThreshold = totalScore >= this.buyConfig.minScore;
-      const entryThreshold = this.buyConfig.minScore * 1.5;
+      // Use the same buyThreshold (12/21) that was defined earlier for consistency
+      // No need to redefine meetsThreshold as it's already defined above
       
       logger.info(`- Score: ${totalScore.toFixed(2)}/21`);
       logger.info(`- Status: ${isBuySignal ? '✅ BUY SIGNAL' : '❌ NO SIGNAL'}`);
@@ -5278,8 +5279,11 @@ class SyrupTradingBot {
         hasSufficientFunds: quoteBalance >= this.buyConfig.minPositionSize
       });
       
-      if (signal && signal.score >= this.buyConfig.minScore) {
-        logger.info(`Buy signal detected with score ${signal.score}/${this.buyConfig.minScore}`);
+      // Use the proper 12/21 threshold (55% of max score)
+      const buyThreshold = Math.ceil(21 * 0.47); // 10 points - adjusted for more responsive buying
+      
+      if (signal && signal.score >= buyThreshold) {
+        logger.info(`Buy signal detected with score ${signal.score}/21 (threshold: ${buyThreshold}/21)`);
         
         // Place buy order with the current price
         try {
@@ -5292,6 +5296,8 @@ class SyrupTradingBot {
             timestamp: new Date().toISOString()
           });
         }
+      } else if (signal) {
+        logger.info(`Buy signal rejected: score ${signal.score.toFixed(2)}/21 below threshold of ${buyThreshold}/21`);
       }
       
     } catch (error) {
