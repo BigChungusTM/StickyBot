@@ -2765,33 +2765,31 @@ class SyrupTradingBot {
       const percentBelow60mHigh = high60mData.percentBelow60mHigh || 0;
       let high60mScore = 0;
       
-      // Calculate 60m high score (0-10 scale) - More sensitive to smaller dips
+      // Calculate 60m high score (0-10 scale) - Even more sensitive to smaller dips
       if (percentBelow60mHigh < 0) {
-        high60mScore = 1;  // New high
-      } else if (percentBelow60mHigh <= 0.25) { // More sensitive (was 0.5)
-        high60mScore = 2;  // Within 0.25% of high
-      } else if (percentBelow60mHigh <= 0.75) { // More sensitive (was 1.0)
-        high60mScore = 3;  // 0.25-0.75% below
-      } else if (percentBelow60mHigh <= 1.25) { // More sensitive (was 1.5)
-        high60mScore = 4;  // 0.75-1.25% below
-      } else if (percentBelow60mHigh <= 1.75) { // More sensitive (was 2.0)
-        high60mScore = 5;  // 1.25-1.75% below
-      } else if (percentBelow60mHigh <= 2.25) { // More sensitive (was 2.5)
-        high60mScore = 6;  // 1.75-2.25% below
-      } else if (percentBelow60mHigh <= 3.0) { // More sensitive (was 4.0)
-        high60mScore = 8;  // 2.25-3% below
-      } else if (percentBelow60mHigh <= 4.0) { // More sensitive (was 5.0)
-        high60mScore = 9;  // 3-4% below
+        high60mScore = 2;  // New high (increased from 1 to 2)
+      } else if (percentBelow60mHigh <= 0.15) { // Ultra sensitive (was 0.25)
+        high60mScore = 3;  // Within 0.15% of high (increased from 2 to 3)
+      } else if (percentBelow60mHigh <= 0.5) { // More sensitive (was 0.75)
+        high60mScore = 5;  // 0.15-0.5% below (increased from 3 to 5)
+      } else if (percentBelow60mHigh <= 1.0) { // More sensitive (was 1.25)
+        high60mScore = 7;  // 0.5-1.0% below (increased from 4 to 7)
+      } else if (percentBelow60mHigh <= 1.5) { // More sensitive (was 1.75)
+        high60mScore = 8;  // 1.0-1.5% below (increased from 5 to 8)
+      } else if (percentBelow60mHigh <= 2.0) { // More sensitive (was 2.25)
+        high60mScore = 9;  // 1.5-2.0% below (increased from 6 to 9)
+      } else if (percentBelow60mHigh <= 3.0) { // No change in threshold
+        high60mScore = 10; // 2.0-3.0% below (increased from 8 to 10)
       } else {
-        high60mScore = 10; // More than 4% below (was 5%)
+        high60mScore = 10; // More than 3.0% below (no change in score)
       }
       
       // Ensure the score is within valid range (0-10)
       high60mScore = Math.max(0, Math.min(10, high60mScore));
       
-      // In ranging markets, give more weight to 24h low score
-      let low24hWeight = 0.6;  // Default 60% weight for 24h low
-      let high60mWeight = 0.4; // Default 40% weight for 60m high
+      // Adjust weights to heavily favor 60m high score for maximum responsiveness
+      let low24hWeight = 0.3;  // Further reduced from 0.4 to 0.3 (30% weight for 24h low)
+      let high60mWeight = 0.7; // Further increased from 0.6 to 0.7 (70% weight for 60m high)
       
       // If we have indicators available, adjust weights dynamically
       if (this.indicators && 
@@ -3948,41 +3946,41 @@ class SyrupTradingBot {
       };
     }
     
-    // Define buy conditions for CEX trading
+    // Define buy conditions for CEX trading - More responsive settings
     const buyConditions = {
-      // RSI between 40-70 (wider range for CEX)
-      rsiOk: indicators.rsi >= 40 && indicators.rsi <= 70,
+      // RSI between 35-70 (wider range for CEX, lowered from 40 to 35 for more responsiveness)
+      rsiOk: indicators.rsi >= 35 && indicators.rsi <= 70,
       
-      // MACD histogram positive or showing improvement - with improved handling for zero/undefined values
-      macdImproving: (typeof indicators.macdHistogram === 'number' && indicators.macdHistogram > -0.0005) || 
+      // MACD histogram positive or showing improvement - more sensitive to small improvements
+      macdImproving: (typeof indicators.macdHistogram === 'number' && indicators.macdHistogram > -0.001) || // More lenient threshold
                     (typeof indicators.macdHistogram === 'number' && typeof indicators.prevMacdHistogram === 'number' && 
                      indicators.macdHistogram > indicators.prevMacdHistogram),
       
-      // Price near EMA20 (-1% to +3% range)
+      // Price near EMA20 (-2% to +3% range) - Wider range below EMA20
       nearEMA20: indicators.ema20 > 0 && 
-                currentPrice > indicators.ema20 * 0.99 && 
+                currentPrice > indicators.ema20 * 0.98 && // More lenient (was 0.99)
                 currentPrice < indicators.ema20 * 1.03,
       
-      // Price above VWAP (bullish)
+      // Price above VWAP (bullish) - No change, this is a good filter
       aboveVWAP: vwap24hInfo.isAboveVWAP,
       
-      // Volume at least 30% above average
-      goodVolume: volumeSpike > 0.3,
+      // Volume at least 20% above average (reduced from 30% for more responsiveness)
+      goodVolume: volumeSpike > 0.2,
       
-      // Some positive momentum
+      // Some positive momentum - No change
       hasMomentum: momentum.score >= 1,
       
-      // Price not too extended from VWAP (avoiding overbought)
+      // Price not too extended from VWAP (avoiding overbought) - More lenient
       notTooExtended: vwap24hInfo.isAboveVWAP ? 
-                     vwap24hInfo.priceVsVwap24h < 25 : // Max 25% above VWAP
+                     vwap24hInfo.priceVsVwap24h < 30 : // Increased from 25% to 30% above VWAP
                      true
     };
     
     // Calculate score components with proper weights for 21-point scale
     const reasons = [];
     
-    // 1. Technical Score: 0-8 points (38.1% of total)
-    const techScoreComponent = Math.min(8, (techScore?.score || 0) * 0.8); // Scale down from 10 to 8
+    // 1. Technical Score: 0-8 points (38.1% of total) - Adjusted for more responsiveness
+    const techScoreComponent = Math.min(8, (techScore?.score || 0) * 0.9); // Increased from 0.8 to 0.9 for more responsive scoring
     
     // 2. Dip Score: 0-5 points (23.8% of total)
     const dipScoreComponent = Math.min(5, dipScore?.score || 0);
