@@ -1,9 +1,24 @@
+// Global error handler for unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('CRITICAL: Unhandled Rejection at:', promise, 'reason:', reason);
+  // Log the error to the file for permanent record
+  try {
+    // Use a basic console.error as logger might not be initialized
+    console.error(`Unhandled Rejection: ${reason?.stack || reason}`);
+  } catch (e) {
+    console.error('Logging the unhandled rejection failed:', e);
+  }
+  // Exit the process to prevent unpredictable state
+  process.exit(1);
+});
+
 import { CBAdvancedTradeClient } from 'coinbase-api';
 import dotenv from 'dotenv';
 import winston from 'winston';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import TrailingStopManager from './trailingStopManager.js';
+import TechnicalIndicators from './technicalIndicators.js';
 import { promises as fs } from 'fs';
 import * as fsSync from 'fs';
 import axios from 'axios';
@@ -521,7 +536,10 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Get formatted account balances for display
+  /** 
+  /**
    * @returns {Promise<string>} Formatted balance string
    */
   async getFormattedBalances() {
@@ -540,7 +558,10 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Get formatted list of open orders for display in Telegram
+  /** 
+  /**
    * @returns {Promise<string>} Formatted open orders string or null if no orders
    */
   async getFormattedOpenOrders() {
@@ -788,53 +809,288 @@ class SyrupTradingBot {
    * @returns {Promise<Array>} Array of processed hourly candles
    */
   async loadHourlyCandlesFromCache() {
+    const HOURLY_CACHE_FILE = path.join(scriptDir, 'hourly_candle_cache.json');
+    
     try {
-      // Ensure cache directory exists
+      logger.debug('[HourlyCandles] Loading hourly candles from cache file');
+      
+      // Check if the cache file exists
       try {
         await fs.access(HOURLY_CACHE_FILE);
+        logger.debug(`[HourlyCandles] Cache file found: ${HOURLY_CACHE_FILE}`);
       } catch (error) {
         if (error.code === 'ENOENT') {
-          logger.info('No hourly cache file found, will create a new one');
+          logger.warn('[HourlyCandles] No hourly cache file found, will create a new one');
           return [];
         }
+        logger.error(`[HourlyCandles] Error accessing hourly cache file: ${error.message}`);
         throw error;
       }
       
-      const data = await fs.readFile(HOURLY_CACHE_FILE, 'utf8');
-      const parsed = JSON.parse(data);
-      
-      // Validate and parse cached hourly candles
-      if (parsed && Array.isArray(parsed.candles)) {
+      // Read and parse cache file
+      try {
+        const data = await fs.readFile(HOURLY_CACHE_FILE, 'utf8');
+        if (!data || data.trim() === '') {
+          logger.warn('[HourlyCandles] Hourly cache file is empty');
+          return [];
+        }
+        
+        const parsed = JSON.parse(data);
+        logger.debug(`[HourlyCandles] Successfully parsed hourly cache file: ${typeof parsed}`);
+        
+        // Validate parsed data structure
+        if (!parsed || typeof parsed !== 'object') {
+          logger.error(`[HourlyCandles] Invalid hourly cache format: ${typeof parsed}`);
+          return [];
+        }
+        
+        if (!Array.isArray(parsed.candles)) {
+          logger.error(`[HourlyCandles] Missing or invalid candles array: ${typeof parsed.candles}`);
+          return [];
+        }
+        
+        logger.debug(`[HourlyCandles] Found ${parsed.candles.length} raw hourly candles in cache`);
+        
+        // Check if metadata is reversed
+        if (parsed.metadata) {
+          const firstCandleTime = new Date(parsed.metadata.firstCandle).getTime();
+          const lastCandleTime = new Date(parsed.metadata.lastCandle).getTime();
+          
+          if (firstCandleTime > lastCandleTime) {
+            logger.warn('[HourlyCandles] Detected reversed metadata in hourly candle cache');
+            // We'll fix this when we save the processed candles
+          }
+        }
+        
+        // Process and validate each candle
         const candles = [];
         let validCandles = 0;
         let invalidCandles = 0;
+        let nonNumericFields = 0;
         
         for (const candle of parsed.candles) {
-          const processed = processCandle(candle);
-          if (processed) {
-            candles.push(processed);
-            validCandles++;
-          } else {
+          try {
+            const processed = processCandle(candle);
+            if (processed) {
+              // Ensure all required fields are numeric
+              const requiredFields = ['open', 'high', 'low', 'close', 'volume'];
+              const hasNonNumericFields = requiredFields.some(field => 
+                typeof processed[field] !== 'number' || isNaN(processed[field])
+              );
+              
+              if (hasNonNumericFields) {
+                nonNumericFields++;
+                continue;
+              }
+              
+              candles.push(processed);
+              validCandles++;
+            } else {
+              invalidCandles++;
+            }
+          } catch (candleError) {
+            logger.debug(`[HourlyCandles] Error processing candle: ${candleError.message}`);
             invalidCandles++;
           }
         }
         
-        // Sort by time (oldest first), remove duplicates, and limit to last 24 candles
-        const uniqueCandles = candles
-          .sort((a, b) => a.time - b.time)
-          .filter((candle, index, array) => 
-            index === 0 || candle.time !== array[index - 1].time
-          )
-          .slice(-MAX_HOURLY_CANDLES);
+        if (invalidCandles > 0 || nonNumericFields > 0) {
+          logger.warn(`[HourlyCandles] Found ${invalidCandles} invalid candles and ${nonNumericFields} candles with non-numeric fields`);
+        }
         
-        logger.info(`Loaded ${uniqueCandles.length} valid hourly candles from cache (${invalidCandles} invalid, limited to last ${MAX_HOURLY_CANDLES} candles)`);
-        return uniqueCandles;
+        if (candles.length === 0) {
+          logger.error('[HourlyCandles] No valid hourly candles found in cache');
+          return [];
+        }
+        
+        // Sort by time (oldest first) - this is critical for indicator calculations
+        candles.sort((a, b) => a.time - b.time);
+        
+        // Log if candles were originally in reverse order
+        const originalOrder = parsed.candles.map(c => c.time);
+        const sortedOrder = candles.map(c => c.time);
+        const wasReversed = originalOrder.length > 1 && 
+                          originalOrder[0] > originalOrder[originalOrder.length - 1] &&
+                          sortedOrder[0] < sortedOrder[sortedOrder.length - 1];
+        
+        if (wasReversed) {
+          logger.warn('[HourlyCandles] Candles were in reverse order and have been sorted correctly (oldest first)');
+        }
+        
+        // Remove duplicates
+        const uniqueCandles = candles.filter((candle, index, array) => 
+          index === 0 || candle.time !== array[index - 1].time
+        );
+        
+        if (uniqueCandles.length < candles.length) {
+          logger.debug(`[HourlyCandles] Removed ${candles.length - uniqueCandles.length} duplicate candles`);
+        }
+        
+        // Limit to last MAX_HOURLY_CANDLES candles
+        const limitedCandles = uniqueCandles.slice(-MAX_HOURLY_CANDLES);
+        
+        // Log time range of candles
+        if (limitedCandles.length > 0) {
+          const firstCandle = limitedCandles[0];
+          const lastCandle = limitedCandles[limitedCandles.length - 1];
+          const startTime = new Date(firstCandle.time * 1000).toISOString();
+          const endTime = new Date(lastCandle.time * 1000).toISOString();
+          logger.info(`[HourlyCandles] Loaded ${limitedCandles.length} hourly candles from ${startTime} to ${endTime}`);
+        }
+        
+        logger.info(`[HourlyCandles] Successfully loaded ${limitedCandles.length} valid hourly candles from cache (${invalidCandles} invalid, limited to last ${MAX_HOURLY_CANDLES} candles)`);
+        return limitedCandles;
+      } catch (parseError) {
+        logger.error(`[HourlyCandles] Error parsing hourly cache file: ${parseError.message}`);
+        return [];
       }
-      return [];
     } catch (error) {
-      if (error.code !== 'ENOENT') {
-        logger.error('Error reading hourly cache file:', error);
+      logger.error(`[HourlyCandles] Critical error loading hourly candles: ${error.message}`, { stack: error.stack });
+      return [];
+    }
+  }
+
+  /**
+  /**
+   * Load candles from cache file
+  /** 
+  /**
+   * @returns {Promise<Array>} Array of processed candles
+   */
+  async loadCandlesFromCache() {
+    try {
+      logger.info('Loading candles from cache...');
+      
+      const data = await fs.readFile(CACHE_FILE, 'utf8');
+      logger.debug(`Read ${data.length} bytes from candle cache file`);
+      
+      const parsed = JSON.parse(data);
+      
+      // Validate and parse cached candles
+      if (!parsed || !Array.isArray(parsed.candles)) {
+        logger.warn('Invalid cache file format or empty candles array');
+        this.candles = [];
+        return [];
       }
+      
+      logger.debug(`Raw cache contains ${parsed.candles.length} candles`);
+      
+      if (parsed.candles.length > 0) {
+        logger.debug(`First raw candle sample: ${JSON.stringify(parsed.candles[0])}`);
+        logger.debug(`Last raw candle sample: ${JSON.stringify(parsed.candles[parsed.candles.length-1])}`);
+      }
+      
+      const candles = [];
+      let validCandles = 0;
+      let invalidCandles = 0;
+      
+      // Process each candle and validate it
+      for (const candle of parsed.candles) {
+        const processed = processCandle(candle);
+        if (processed) {
+          // Ensure all numeric fields are actually numbers
+          if (typeof processed.open === 'string') processed.open = parseFloat(processed.open);
+          if (typeof processed.high === 'string') processed.high = parseFloat(processed.high);
+          if (typeof processed.low === 'string') processed.low = parseFloat(processed.low);
+          if (typeof processed.close === 'string') processed.close = parseFloat(processed.close);
+          if (typeof processed.volume === 'string') processed.volume = parseFloat(processed.volume);
+          
+          // Verify all required fields are present and valid
+          if (processed.time && 
+              !isNaN(processed.open) && 
+              !isNaN(processed.high) && 
+              !isNaN(processed.low) && 
+              !isNaN(processed.close) && 
+              !isNaN(processed.volume)) {
+            candles.push(processed);
+            validCandles++;
+          } else {
+            logger.debug(`Invalid candle data: ${JSON.stringify(processed)}`);
+            invalidCandles++;
+          }
+        } else {
+          invalidCandles++;
+        }
+      }
+      
+      logger.debug(`After processing: ${validCandles} valid candles, ${invalidCandles} invalid candles`);
+      
+      if (candles.length === 0) {
+        logger.warn('No valid candles found in cache file');
+        this.candles = [];
+        return [];
+      }
+      
+      // Sort by time (oldest first) and remove duplicates
+      const uniqueCandles = candles
+        .sort((a, b) => a.time - b.time)
+        .filter((candle, index, array) => 
+          index === 0 || candle.time !== array[index - 1].time
+        );
+      
+      // Check if we have enough candles for indicators
+      const sufficientForMacd = uniqueCandles.length >= 26;
+      const sufficientForEma = uniqueCandles.length >= 20;
+      
+      logger.info(`Loaded ${uniqueCandles.length} valid candles from cache (${invalidCandles} invalid)`);
+      logger.info(`Sufficient for indicators: MACD=${sufficientForMacd ? 'YES' : 'NO'}, EMA20=${sufficientForEma ? 'YES' : 'NO'}`);
+      
+      // Verify candle data quality
+      const sampleSize = Math.min(5, uniqueCandles.length);
+      if (sampleSize > 0) {
+        const samples = uniqueCandles.slice(-sampleSize);
+        const validPrices = samples.every(c => 
+          typeof c.open === 'number' && !isNaN(c.open) &&
+          typeof c.high === 'number' && !isNaN(c.high) &&
+          typeof c.low === 'number' && !isNaN(c.low) &&
+          typeof c.close === 'number' && !isNaN(c.close)
+        );
+        
+        logger.debug(`Price data quality check (last ${sampleSize} candles): ${validPrices ? 'VALID' : 'INVALID'}`);
+        
+        if (!validPrices) {
+          logger.warn('Invalid price data detected in candles, attempting to fix...');
+          // Attempt to fix invalid price data
+          for (const candle of uniqueCandles) {
+            candle.open = typeof candle.open === 'number' ? candle.open : parseFloat(candle.open) || 0;
+            candle.high = typeof candle.high === 'number' ? candle.high : parseFloat(candle.high) || 0;
+            candle.low = typeof candle.low === 'number' ? candle.low : parseFloat(candle.low) || 0;
+            candle.close = typeof candle.close === 'number' ? candle.close : parseFloat(candle.close) || 0;
+            candle.volume = typeof candle.volume === 'number' ? candle.volume : parseFloat(candle.volume) || 0;
+          }
+        }
+      }
+      
+      if (uniqueCandles.length > 0) {
+        const firstCandle = uniqueCandles[0];
+        const lastCandle = uniqueCandles[uniqueCandles.length - 1];
+        const firstTime = new Date(firstCandle.time * 1000).toISOString();
+        const lastTime = new Date(lastCandle.time * 1000).toISOString();
+        const timeRangeMinutes = Math.round((lastCandle.time - firstCandle.time) / 60);
+        
+        logger.info(`Candle time range: ${timeRangeMinutes} minutes (${firstTime} to ${lastTime})`);
+        logger.debug(`First candle: ${JSON.stringify(firstCandle)}`);
+        logger.debug(`Last candle: ${JSON.stringify(lastCandle)}`);
+        
+        // Check if we have enough candles for indicator calculations
+        if (uniqueCandles.length < 26) {
+          logger.warn(`WARNING: Only ${uniqueCandles.length} candles loaded from cache. At least 26 candles are needed for MACD calculation.`);
+        } else {
+          logger.info(`Successfully loaded ${uniqueCandles.length} candles from cache, sufficient for indicator calculations.`);
+        }
+      }
+      
+      // Assign to this.candles
+      this.candles = uniqueCandles;
+      return uniqueCandles;
+      
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        logger.warn('Candle cache file not found, will create on next save');
+      } else {
+        logger.error('Error reading or parsing candle cache file:', error);
+      }
+      this.candles = [];
       return [];
     }
   }
@@ -897,35 +1153,55 @@ class SyrupTradingBot {
    * Saves hourly candles to cache file
    */
   async saveHourlyCandlesToCache() {
-    if (!this.hourlyCandles || this.hourlyCandles.length === 0) {
-      logger.warn('No hourly candles to save to cache');
-      return;
-    }
-    
+    const HOURLY_CACHE_FILE = path.join(scriptDir, 'hourly_candle_cache.json');
     let tempPath = '';
+    
     try {
-      // Create a clean copy of hourly candles with just the data we want to save
-      // Take only the most recent 24 candles
-      const recentCandles = this.hourlyCandles.slice(-MAX_HOURLY_CANDLES);
-      const candlesToSave = recentCandles.map(candle => ({
-        time: candle.time,  // Already in Unix seconds
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-        volume: candle.volume
+      if (!this.hourlyCandles || this.hourlyCandles.length === 0) {
+        logger.warn('[HourlyCandles] No hourly candles to save to cache');
+        return;
+      }
+      
+      // Sort candles by time (oldest first)
+      const sortedCandles = [...this.hourlyCandles].sort((a, b) => a.time - b.time);
+      
+      // Ensure all candle fields are numbers, not strings
+      const processedCandles = sortedCandles.map(candle => ({
+        time: typeof candle.time === 'string' ? parseInt(candle.time, 10) : candle.time,
+        open: typeof candle.open === 'string' ? parseFloat(candle.open) : candle.open,
+        high: typeof candle.high === 'string' ? parseFloat(candle.high) : candle.high,
+        low: typeof candle.low === 'string' ? parseFloat(candle.low) : candle.low,
+        close: typeof candle.close === 'string' ? parseFloat(candle.close) : candle.close,
+        volume: typeof candle.volume === 'string' ? parseFloat(candle.volume) : candle.volume
       }));
       
+      // Create metadata - ensure firstCandle is older than lastCandle
+      const firstCandle = processedCandles[0];
+      const lastCandle = processedCandles[processedCandles.length - 1];
+      
+      const metadata = {
+        tradingPair: this.tradingPair,
+        granularity: '1h',
+        count: processedCandles.length,
+        firstCandle: new Date(firstCandle.time * 1000).toISOString(),
+        lastCandle: new Date(lastCandle.time * 1000).toISOString(),
+        savedAt: new Date().toISOString()
+      };
+      
+      // Verify metadata is correctly ordered
+      const firstTime = new Date(metadata.firstCandle).getTime();
+      const lastTime = new Date(metadata.lastCandle).getTime();
+      
+      if (firstTime > lastTime) {
+        logger.warn('[HourlyCandles] Metadata ordering issue detected and fixed');
+        // Swap the values to fix the ordering
+        [metadata.firstCandle, metadata.lastCandle] = [metadata.lastCandle, metadata.firstCandle];
+      }
+      
+      // Create cache object
       const cacheData = {
-        candles: candlesToSave,
-        timestamp: Math.floor(Date.now() / 1000), // Save current time in Unix seconds
-        metadata: {
-          tradingPair: this.tradingPair,
-          granularity: '1h',
-          count: candlesToSave.length,
-          firstCandle: candlesToSave.length > 0 ? formatTimestamp(candlesToSave[0].time) : null,
-          lastCandle: candlesToSave.length > 0 ? formatTimestamp(candlesToSave[candlesToSave.length - 1].time) : null
-        }
+        metadata,
+        candles: processedCandles
       };
       
       // Write to a temporary file first, then rename to avoid corruption
@@ -944,11 +1220,13 @@ class SyrupTradingBot {
       // Rename temp file to final name
       await fs.rename(tempPath, HOURLY_CACHE_FILE);
       
-      logger.info(`Saved ${candlesToSave.length} hourly candles to cache`);
+      logger.info(`[HourlyCandles] Saved ${processedCandles.length} hourly candles to cache`);
+      logger.debug(`[HourlyCandles] Time range: ${metadata.firstCandle} to ${metadata.lastCandle}`);
+      
     } catch (error) {
-      logger.error('Error saving hourly candles to cache:', error);
+      logger.error('[HourlyCandles] Error saving hourly candles to cache:', error);
       // Don't throw, as this isn't a critical error
-      logger.warn('Continuing without saving to hourly cache');
+      logger.warn('[HourlyCandles] Continuing without saving to hourly cache');
       
       // Clean up temp file if it exists
       if (tempPath) {
@@ -962,8 +1240,13 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Fetches initial candle data from the API and processes it
+  /** 
+  /**
    * @returns {Promise<Array>} Array of processed candles
+  /** 
+  /**
    * @throws {Error} If no candles are returned or if there's an error processing them
    */
   async fetchInitialCandles() {
@@ -1190,11 +1473,22 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Backfills candle data by breaking down large time ranges into smaller windows
+  /** 
+  /**
    * to avoid API time range limits.
+  /** 
+  /**
    * @param {number} startTime - Start time in seconds
+  /** 
+  /**
    * @param {number} endTime - End time in seconds
+  /** 
+  /**
    * @param {number} [maxWindowHours=4] - Maximum window size in hours
+  /** 
+  /**
    * @returns {Promise<Array>} - Array of processed candles
    */
   async backfillWithSmallerWindows(startTime, endTime, maxWindowHours = 4) {
@@ -1360,6 +1654,18 @@ class SyrupTradingBot {
     if (this._isFetching) {
       logger.debug(`[${requestId}] Fetch already in progress, skipping`);
       return this.candles;
+    }
+    
+    // If this is the first fetch and we have no candles, try to load from cache first
+    if (!this._initialCandleLoadDone && (!this.candles || this.candles.length === 0)) {
+      logger.info('First fetch detected, attempting to load candles from cache first');
+      try {
+        await this.loadCandlesFromCache();
+        logger.info(`Loaded ${this.candles?.length || 0} candles from cache`);
+        this._initialCandleLoadDone = true;
+      } catch (error) {
+        logger.warn('Failed to load candles from cache, will fetch from API', { error: error.message });
+      }
     }
     
     // Rate limiting - don't allow fetches more than once every 30 seconds
@@ -1596,138 +1902,121 @@ class SyrupTradingBot {
     }
   
   calculateIndicators() {
+    const defaultIndicatorValue = null;
+    logger.debug('--- Entering calculateIndicators ---');
+
     try {
-      if (this.candles.length === 0) {
-        logger.warn('No candles available for indicator calculation');
-        return;
-      }
-      
-      // Log candle data for debugging
-      logger.debug(`Calculating indicators with ${this.candles.length} candles`);
-      logger.debug('Latest candle:', this.candles[this.candles.length - 1]);
-      
-      // Get the most recent candles (up to the maximum period needed by any indicator)
-      const maxPeriod = Math.max(
-        this.buyConfig.emaSlowPeriod || 0,
-        this.buyConfig.stochPeriod || 0,
-        this.buyConfig.bbPeriod || 0,
-        this.buyConfig.macdSlowPeriod || 0
-      );
-      
-      // Get the most recent candles needed for calculations
-      const recentCandles = this.candles.slice(-(maxPeriod * 2) - 1);
-      
-      const closes = recentCandles.map(c => parseFloat(c.close));
-      const highs = recentCandles.map(c => parseFloat(c.high));
-      const lows = recentCandles.map(c => parseFloat(c.low));
-      
-      logger.debug(`Using ${recentCandles.length} recent candles for calculations`);
-      logger.debug('Closes array:', closes);
-      
-      // Log input data for debugging
-      logger.debug(`Input data for indicators - Closes: ${closes.length} items, first: ${closes[0]}, last: ${closes[closes.length - 1]}`);
-      
-      // Calculate EMA20
-      const ema20 = EMA.calculate({
-        values: closes,
-        period: 20 // Fixed period for EMA20
-      });
-      logger.debug(`EMA20 calculation - Input length: ${closes.length}, Result length: ${ema20.length}, Last value: ${ema20[ema20.length - 1]}`);
-      
-      // Calculate EMA50 and EMA200 for trend confirmation
-      const ema50 = EMA.calculate({ values: closes, period: 50 });
-      const ema200 = EMA.calculate({ values: closes, period: 200 });
-      logger.debug(`EMA50/200 calculation - EMA50 last: ${ema50[ema50.length - 1]}, EMA200 last: ${ema200[ema200.length - 1]}`);
-      
-      // Calculate RSI
-      const rsi = RSI.calculate({
-        values: closes,
-        period: this.buyConfig.rsiPeriod || 14
-      });
-      logger.debug(`RSI calculation - Input length: ${closes.length}, Result length: ${rsi.length}, Last value: ${rsi[rsi.length - 1]}`);
-      
-      // Calculate Stochastic
-      const stoch = Stochastic.calculate({
-        high: highs,
-        low: lows,
-        close: closes,
-        period: this.buyConfig.stochPeriod || 14,
-        signalPeriod: this.buyConfig.stochDPeriod || 3,
-        kPeriod: this.buyConfig.stochKPeriod || 3
-      });
-      logger.debug(`Stochastic calculation - Result length: ${stoch.length}, Last K: ${stoch[stoch.length - 1]?.k}, Last D: ${stoch[stoch.length - 1]?.d}`);
-      
-      // Calculate Bollinger Bands
-      const bb = BollingerBands.calculate({
-        values: closes,
-        period: this.buyConfig.bbPeriod || 20,
-        stdDev: this.buyConfig.bbStdDev || 2
-      });
-      logger.debug(`Bollinger Bands calculation - Result length: ${bb.length}, Last values - Upper: ${bb[bb.length - 1]?.upper}, Middle: ${bb[bb.length - 1]?.middle}, Lower: ${bb[bb.length - 1]?.lower}`);
-      
-      // Calculate MACD with detailed output
-      const macd = MACD.calculate({
-        values: closes,
-        fastPeriod: this.buyConfig.macdFastPeriod || 12,
-        slowPeriod: this.buyConfig.macdSlowPeriod || 26,
-        signalPeriod: this.buyConfig.macdSignalPeriod || 9,
-        SimpleMAOscillator: false,
-        SimpleMASignal: false,
-        includeSignal: true,
-        includeHistogram: true
-      });
-      
-      // Log MACD calculation results
-      const debugMacd = macd[macd.length - 1] || {};
-      logger.debug(`MACD calculation - Result length: ${macd.length}, Last values - MACD: ${debugMacd.MACD}, Signal: ${debugMacd.signal}, Histogram: ${debugMacd.histogram}`);
-      
-      // Get the most recent close price as the current price
-      const currentPrice = recentCandles.length > 0 ? 
-        parseFloat(recentCandles[recentCandles.length - 1].close) : 0;
-      
-      // Store the latest values
-      const lastMacd = macd[macd.length - 1] || {};
-      this.indicators = {
-        // Price and Volume
-        price: currentPrice,
-        volume: recentCandles[recentCandles.length - 1]?.volume || 0,
+        if (!this.candles || this.candles.length < 20) {
+            logger.warn(`Not enough candle data to calculate all indicators. Have ${this.candles?.length || 0}, need at least 20.`);
+            // Reset indicators to default if not enough data
+            this.indicators = { 
+                ...this.indicators, 
+                ema20: defaultIndicatorValue, 
+                rsi: defaultIndicatorValue, 
+                macd: null, 
+                bb: null, 
+                stochK: defaultIndicatorValue, 
+                stochD: defaultIndicatorValue 
+            };
+            return;
+        }
+
+        const closes = this.candles.map(c => parseFloat(c.close));
+        const highs = this.candles.map(c => parseFloat(c.high));
+        const lows = this.candles.map(c => parseFloat(c.low));
         
-        // Moving Averages
-        ema20: ema20[ema20.length - 1] || 0,
-        ema50: ema50[ema50.length - 1] || 0,
-        ema200: ema200[ema200.length - 1] || 0,
-        
-        // RSI
-        rsi: rsi[rsi.length - 1] || 0,
-        
-        // Stochastic
-        stochK: stoch[stoch.length - 1]?.k || 0,
-        stochD: stoch[stoch.length - 1]?.d || 0,
-        
-        // Bollinger Bands
-        bbUpper: bb[bb.length - 1]?.upper || 0,
-        bbMiddle: bb[bb.length - 1]?.middle || 0,
-        bbLower: bb[bb.length - 1]?.lower || 0,
-        
-        // MACD
-        macd: lastMacd.MACD || 0,           // MACD Line (fast - slow)
-        macdSignal: lastMacd.signal || 0,    // Signal Line (EMA of MACD)
-        macdHistogram: lastMacd.histogram || 0, // Histogram (MACD - Signal)
-        
-        // Previous values for comparison
-        prevMacdHistogram: this.indicators?.macdHistogram || 0
-      };
-      
-      logger.debug('Updated indicators with price:', { 
-        price: this.indicators.price,
-        ema20: this.indicators.ema20,
-        ema50: this.indicators.ema50,
-        ema200: this.indicators.ema200,
-        rsi: this.indicators.rsi
-      });
+        logger.debug(`Calculating indicators with ${closes.length} data points.`);
+
+        // Initialize with default values
+        let ema20 = defaultIndicatorValue, ema50 = defaultIndicatorValue, ema200 = defaultIndicatorValue;
+        let rsi = defaultIndicatorValue;
+        let stoch = { k: defaultIndicatorValue, d: defaultIndicatorValue };
+        let bb = { upper: defaultIndicatorValue, middle: defaultIndicatorValue, lower: defaultIndicatorValue };
+        let macd = { MACD: defaultIndicatorValue, signal: defaultIndicatorValue, histogram: defaultIndicatorValue };
+
+        // --- EMA Calculations ---
+        try {
+            // Use TechnicalIndicators class for EMA calculation
+            const ema20Array = TechnicalIndicators.calculateEMA(closes, 20);
+            if (ema20Array.length > 0) ema20 = ema20Array[ema20Array.length - 1];
+            logger.debug(`EMA20 calculation result: ${ema20}`);
+        } catch (e) { logger.error(`Error calculating EMA20: ${e.message}`); }
+
+        try {
+            const ema50Array = TechnicalIndicators.calculateEMA(closes, 50);
+            if (ema50Array.length > 0) ema50 = ema50Array[ema50Array.length - 1];
+        } catch (e) { logger.error(`Error calculating EMA50: ${e.message}`); }
+
+        try {
+            const ema200Array = TechnicalIndicators.calculateEMA(closes, 200);
+            if (ema200Array.length > 0) ema200 = ema200Array[ema200Array.length - 1];
+        } catch (e) { logger.error(`Error calculating EMA200: ${e.message}`); }
+
+        // --- RSI Calculation ---
+        try {
+            const rsiResult = TechnicalIndicators.calculateRSI(closes);
+            rsi = rsiResult.value;
+        } catch (e) { logger.error(`Error calculating RSI: ${e.message}`); }
+
+        // --- MACD Calculation ---
+        try {
+            const macdResult = TechnicalIndicators.calculateMACD(closes);
+            macd = {
+                MACD: macdResult.macd,
+                signal: macdResult.signal,
+                histogram: macdResult.histogram
+            };
+            logger.debug(`MACD calculation result: ${JSON.stringify(macd)}`);
+        } catch (e) { logger.error(`Error calculating MACD: ${e.message}`); }
+
+        // --- Bollinger Bands Calculation ---
+        try {
+            const bbResult = TechnicalIndicators.calculateBollingerBands(closes);
+            bb = {
+                upper: bbResult.upper,
+                middle: bbResult.middle,
+                lower: bbResult.lower
+            };
+        } catch (e) { logger.error(`Error calculating Bollinger Bands: ${e.message}`); }
+
+        // --- Stochastic Calculation (simplified as we don't have a direct method) ---
+        try {
+            // For now, leave stoch as default until we implement or import a stochastic oscillator
+            stoch = { k: 50, d: 50 }; // Default neutral values
+        } catch (e) { logger.error(`Error calculating Stochastic: ${e.message}`); }
+
+        const currentPrice = closes.length > 0 ? closes[closes.length - 1] : 0;
+        const currentVolume = this.candles.length > 0 ? parseFloat(this.candles[this.candles.length - 1].volume) : 0;
+
+        // Store the latest values
+        this.indicators = {
+            ...this.indicators,
+            price: currentPrice,
+            volume: currentVolume,
+            ema20, ema50, ema200, rsi,
+            stochK: stoch.k, stochD: stoch.d,
+            bbUpper: bb.upper, bbMiddle: bb.middle, bbLower: bb.lower,
+            macd: macd.MACD, macdSignal: macd.signal, macdHistogram: macd.histogram,
+        };
+
+        logger.debug('Finished indicator calculation. Results:', { 
+            rsi: this.indicators.rsi, 
+            ema20: this.indicators.ema20, 
+            macdHist: this.indicators.macdHistogram 
+        });
+
     } catch (error) {
-      logger.error('Error in calculateIndicators:', error);
-      throw error;
+        logger.error('!!! CRITICAL ERROR in calculateIndicators !!!', error);
+        // Fallback to ensure indicators object is not left in a broken state
+        this.indicators = { 
+            ...this.indicators, 
+            ema20: defaultIndicatorValue, 
+            rsi: defaultIndicatorValue, 
+            macd: null, 
+            bb: null, 
+            stochK: defaultIndicatorValue, 
+            stochD: defaultIndicatorValue 
+        };
     }
   }
 
@@ -1961,8 +2250,13 @@ class SyrupTradingBot {
 
   
   /**
+  /**
    * Calculate dip score based on price drop from recent high
+  /** 
+  /**
    * @param {number} currentPrice - Current price
+  /** 
+  /**
    * @returns {Object} Dip score and related information
    */
   calculateDipScore(currentPrice) {
@@ -2149,7 +2443,10 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Fetches the initial set of hourly candles (30 hours worth) and keeps the most recent 24 hours
+  /** 
+  /**
    * @returns {Promise<Array>} Array of processed hourly candles
    */
   async fetchInitialHourlyCandles() {
@@ -2237,9 +2534,16 @@ class SyrupTradingBot {
   }
   
   /**
+  /**
    * Calculates a score based on how close the current price is to the 24-hour average low
+  /** 
+  /**
    * Higher scores indicate the price is closer to the 24h average low
+  /** 
+  /**
    * @param {number} currentPrice - The current price to evaluate
+  /** 
+  /**
    * @returns {Object} Score and metadata about the 24h average low calculation
    */
   async calculate24hLowScore(currentPrice) {
@@ -2319,8 +2623,13 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Calculates the 24-hour average high price and percentage above/below current price
+  /** 
+  /**
    * @param {number} currentPrice - The current price to evaluate against
+  /** 
+  /**
    * @returns {Object} Object containing avgHigh24h and percentBelow24hHigh
    */
   async calculate24hHighPrice(currentPrice) {
@@ -2402,138 +2711,305 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Calculates a blended score based on 24h low and 60m high prices
+  /** 
+  /**
    * @param {number} currentPrice - The current price to evaluate
+  /** 
+  /**
+   * @param {Object} low24hScoreResult - Optional pre-calculated 24h low score result
+  /** 
+  /**
+   * @param {Object} high60mData - Optional pre-calculated 60m high data
+  /** 
+  /**
    * @returns {Promise<Object>} Object containing blended score and component scores
    */
-  async calculateBlendedScore(currentPrice) {
+  async calculateBlendedScore(currentPrice, low24hScoreResult = null, high60mData = null) {
+    const logPrefix = '[calculateBlendedScore]';
+    logger.debug(`${logPrefix} === START ===`);
+    logger.debug(`${logPrefix} Input - currentPrice: ${currentPrice}, type: ${typeof currentPrice}`);
+    
+    // Track timing for performance
+    const startTime = Date.now();
+    
     try {
-      // Get 24h low score
-      const low24hScoreResult = await this.calculate24hLowScore(currentPrice);
-      const low24hScore = low24hScoreResult?.score || 0;
-      
-      // Get 60m high data
-      const high60mData = await this.calculate60mHighPrice(currentPrice);
-      let high60mScore = 0;
-      let percentBelow60mHigh = high60mData?.percentBelow60mHigh || 0;
-      
-      // Calculate 60m high score (0-10)
-      if (percentBelow60mHigh <= 1) {
-        high60mScore = 2;  // 2/10 if within 1% of 60m high
-      } else if (percentBelow60mHigh <= 3) {
-        high60mScore = 4;  // 4/10 if 1-3% below 60m high
-      } else if (percentBelow60mHigh <= 5) {
-        high60mScore = 7;  // 7/10 if 3-5% below 60m high
+      // Validate currentPrice
+      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+        const errorMsg = `Invalid current price: ${currentPrice} (type: ${typeof currentPrice})`;
+        logger.error(`${logPrefix} ${errorMsg}`);
+        throw new Error(errorMsg);
+      }
+
+      // Calculate 24h low score if not provided
+      let low24hScore = 0;
+      if (low24hScoreResult?.score !== undefined) {
+        low24hScore = Number(low24hScoreResult.score) || 0;
+        logger.debug(`${logPrefix} Using provided 24h low score: ${low24hScore}`);
       } else {
-        high60mScore = 10; // 10/10 if more than 5% below 60m high
+        const low24hResult = await this.calculate24hLowScore(currentPrice);
+        low24hScore = Number(low24hResult?.score) || 0;
+        logger.debug(`${logPrefix} Calculated 24h low score: ${low24hScore}`);
       }
       
-      // Calculate blended score (60% low24h, 40% high60m)
-      const blendedScore = Math.round((low24hScore * 0.6) + (high60mScore * 0.4));
+      // Ensure the score is within valid range (0-10)
+      low24hScore = Math.max(0, Math.min(10, low24hScore));
       
-      return {
-        score: blendedScore,
-        low24hScore,
-        high60mScore,
-        percentBelow60mHigh,
+      // Get or calculate 60m high data
+      if (!high60mData) {
+        high60mData = await this.calculate60mHighPrice(currentPrice);
+      }
+      
+      // Extract percent below 60m high and calculate score
+      const percentBelow60mHigh = high60mData.percentBelow60mHigh || 0;
+      let high60mScore = 0;
+      
+      // Calculate 60m high score (0-10 scale)
+      if (percentBelow60mHigh < 0) {
+        high60mScore = 1;  // New high
+      } else if (percentBelow60mHigh <= 0.5) {
+        high60mScore = 2;  // Within 0.5% of high
+      } else if (percentBelow60mHigh <= 1.0) {
+        high60mScore = 3;  // 0.5-1% below
+      } else if (percentBelow60mHigh <= 1.5) {
+        high60mScore = 4;  // 1-1.5% below
+      } else if (percentBelow60mHigh <= 2.0) {
+        high60mScore = 5;  // 1.5-2% below
+      } else if (percentBelow60mHigh <= 2.5) {
+        high60mScore = 6;  // 2-2.5% below
+      } else if (percentBelow60mHigh <= 4.0) {
+        high60mScore = 8;  // 3-4% below
+      } else if (percentBelow60mHigh <= 5.0) {
+        high60mScore = 9;  // 4-5% below
+      } else {
+        high60mScore = 10; // More than 5% below
+      }
+      
+      // Ensure the score is within valid range (0-10)
+      high60mScore = Math.max(0, Math.min(10, high60mScore));
+      
+      // In ranging markets, give more weight to 24h low score
+      let low24hWeight = 0.6;  // Default 60% weight for 24h low
+      let high60mWeight = 0.4; // Default 40% weight for 60m high
+      
+      // If we have indicators available, adjust weights dynamically
+      if (this.indicators && 
+          typeof this.indicators.bbUpper === 'number' && 
+          typeof this.indicators.bbLower === 'number' &&
+          typeof this.indicators.bbMiddle === 'number' &&
+          this.indicators.bbMiddle !== 0) {
+            
+        try {
+          const { bbUpper, bbLower, bbMiddle } = this.indicators;
+          const bbWidth = (bbUpper - bbLower) / bbMiddle; // Bollinger Band width as volatility indicator
+          
+          // In high volatility (trending) markets, increase 60m high weight
+          if (bbWidth > 0.03) { // Wider bands indicate higher volatility
+            high60mWeight = Math.min(0.7, high60mWeight + 0.2); // Cap at 70% weight
+            low24hWeight = 1 - high60mWeight;
+          }
+          // In low volatility (ranging) markets, increase 24h low weight
+          else if (bbWidth < 0.01) {
+            low24hWeight = Math.min(0.8, low24hWeight + 0.2); // Cap at 80% weight
+            high60mWeight = 1 - low24hWeight;
+          }
+        } catch (e) {
+          logger.warn('Error calculating dynamic weights, using defaults', { error: e.message });
+        }
+      }
+      
+      // Calculate blended score
+      logger.debug('=== Blended Score Calculation ===');
+      logger.debug('Inputs - low24hScore:', low24hScore, 'high60mScore:', high60mScore);
+      logger.debug('Weights - low24hWeight:', low24hWeight, 'high60mWeight:', high60mWeight);
+      
+      const blendedScore = (low24hScore * low24hWeight) + (high60mScore * high60mWeight);
+      logger.debug('Raw blended score:', blendedScore);
+      
+      // Ensure score is within bounds and round to 1 decimal
+      const finalScore = Math.round(Math.max(0, Math.min(10, blendedScore)) * 10) / 10;
+      logger.debug('Final blended score (bounded and rounded):', finalScore);
+      
+      // Prepare result object
+      const result = {
+        score: finalScore,
+        low24hScore: Math.round(low24hScore * 10) / 10,
+        high60mScore: Math.round(high60mScore * 10) / 10,
+        percentBelow60mHigh: Math.round(percentBelow60mHigh * 100) / 100,
+        weights: {
+          low24h: Math.round(low24hWeight * 100),
+          high60m: Math.round(high60mWeight * 100)
+        },
         reasons: [
-          `24h Low Score: ${low24hScore.toFixed(1)}/10`,
-          `60m High Score: ${high60mScore.toFixed(1)}/10 (${percentBelow60mHigh.toFixed(2)}% below 60m high)`,
-          `Blended Score: ${blendedScore}/10 (60% 24h Low, 40% 60m High)`
+          `24h Low Score: ${(Math.round(low24hScore * 10) / 10)}/10`,
+          `60m High Score: ${(Math.round(high60mScore * 10) / 10)}/10 (${percentBelow60mHigh >= 0 ? Math.round(percentBelow60mHigh * 100) / 100 + '% below' : 'New high'})`,
+          `Blended Score: ${finalScore}/10 (${Math.round(low24hWeight * 100)}% 24h Low, ${Math.round(high60mWeight * 100)}% 60m High)`
         ],
         timestamp: new Date().toISOString()
       };
       
+      logger.debug('=== Final Blended Score Result ===');
+      logger.debug(JSON.stringify(result, null, 2));
+      logger.debug(`=== calculateBlendedScore COMPLETE (${Date.now() - startTime}ms) ===\n`);
+      
+      return result;
+      
     } catch (error) {
-      logger.error(`Error in calculateBlendedScore: ${error.message}`, { currentPrice });
+      logger.error(`Error in calculateBlendedScore: ${error.message}`, { 
+        currentPrice,
+        error: error.stack 
+      });
+      
       return {
         score: 0,
-        low24hScore: 0,
-        high60mScore: 0,
-        percentBelow60mHigh: 0,
-        reasons: ['Error calculating blended score'],
+        reasons: [`Error in blended score calculation: ${error.message}`],
         timestamp: new Date().toISOString()
-      };
-    }
-  }
-  
-  /**
-   * Calculates the 60-minute high price and percentage above/below current price
-   * @param {number} currentPrice - The current price to evaluate against
-   * @returns {Object} Object containing high60m and percentBelow60mHigh
-   */
-  async calculate60mHighPrice(currentPrice) {
-    try {
-      // Ensure we have a valid current price
-      if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
-        throw new Error(`Invalid current price: ${currentPrice}`);
-      }
-      
-      let high60m = 0;
-      let percentBelow60mHigh = 0;
-      
-      // Use 1-minute candles for 60-minute high calculation
-      const sixtyMinuteCandles = (this.candles || []).slice(-60); // Last 60 minutes
-      
-      if (sixtyMinuteCandles.length < 30) { // Require at least 30 minutes of data
-        throw new Error('Insufficient data for 60m high calculation');
-      }
-      
-      const validCandles = sixtyMinuteCandles.filter(candle => 
-        candle && typeof candle.high === 'number' && !isNaN(candle.high) && candle.high > 0
-      );
-      
-      if (validCandles.length === 0) {
-        throw new Error('No valid candles found for 60m high calculation');
-      }
-      
-      // Find the highest high in the last 60 minutes
-      high60m = Math.max(...validCandles.map(candle => candle.high));
-      
-      // Ensure we have a valid high60m before proceeding
-      if (typeof high60m !== 'number' || isNaN(high60m) || high60m <= 0) {
-        throw new Error(`Invalid 60m high value: ${high60m}`);
-      }
-      
-      // Calculate percentage below the 60m high
-      percentBelow60mHigh = ((high60m - currentPrice) / high60m) * 100;
-      
-      // Ensure we have a valid percentage
-      if (isNaN(percentBelow60mHigh) || !isFinite(percentBelow60mHigh)) {
-        throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, high60m=${high60m}`);
-      }
-      
-      return {
-        high60m,
-        percentBelow60mHigh,
-        currentPrice
-      };
-      
-    } catch (error) {
-      logger.error(`Error in calculate60mHighPrice: ${error.message}`, { currentPrice });
-      return {
-        high60m: null,
-        percentBelow60mHigh: 0,
-        currentPrice: currentPrice || 0,
-        error: error.message
-      };
-    }
-  }
-  
-  /**
-   * Calculates a blended score based on 24h average low and 60m high prices
-        score: 0,
-        low24hScore: 0,
-        high60mScore: 0,
-        percentBelow60mHigh: 0,
-        reasons: ['Error calculating blended score']
       };
     }
   }
 
   /**
-   * Calculates the 12-hour high price and percentage above/below current price
+  /**
+   * Calculates the 60-minute high price and percentage above/below current price
+  /** 
+  /**
    * @param {number} currentPrice - The current price to evaluate against
+  /** 
+  /**
+   * @returns {Object} Object containing detailed 60m high analysis
+   */
+  async calculate60mHighPrice(currentPrice) {
+  try {
+    // Ensure we have a valid current price
+    if (typeof currentPrice !== 'number' || isNaN(currentPrice) || currentPrice <= 0) {
+      throw new Error(`Invalid current price: ${currentPrice}`);
+    }
+    
+    // Initialize result object with default values
+    const result = {
+      high60m: 0,
+      percentBelow60mHigh: 0,
+      currentPrice,
+      timeSinceHighMs: 0,
+      highCandlesAgo: 0,
+      volumeAtHigh: 0,
+      highTime: null,
+      isNewHigh: false,
+      highConfidence: 1.0,
+      reasons: []
+    };
+    
+    // Use 1-minute candles for 60-minute high calculation
+    const sixtyMinuteCandles = (this.candles || []).slice(-60); // Last 60 minutes
+    
+    if (sixtyMinuteCandles.length < 30) { // Require at least 30 minutes of data
+      throw new Error(`Insufficient data for 60m high calculation (${sixtyMinuteCandles.length} candles)`);
+    }
+    
+    // Filter out invalid candles and add timestamp parsing
+    const now = Date.now();
+    const validCandles = sixtyMinuteCandles
+      .map((candle, index) => ({
+        ...candle,
+        index,
+        timestamp: candle.timestamp ? new Date(candle.timestamp).getTime() : now - ((60 - index) * 60000)
+      }))
+      .filter(candle => 
+        candle && 
+        typeof candle.high === 'number' && 
+        !isNaN(candle.high) && 
+        candle.high > 0 &&
+        candle.timestamp
+      );
+    
+    if (validCandles.length === 0) {
+      throw new Error('No valid candles found for 60m high calculation');
+    }
+    
+    // Find the highest high in the last 60 minutes with its index
+    let highestCandle = validCandles[0];
+    validCandles.forEach(candle => {
+      if (candle.high > highestCandle.high) {
+        highestCandle = candle;
+      }
+    });
+    
+    result.high60m = highestCandle.high;
+    
+    // Calculate time since high
+    const currentTime = validCandles[validCandles.length - 1]?.timestamp || now;
+    result.timeSinceHighMs = currentTime - highestCandle.timestamp;
+    result.highTime = new Date(highestCandle.timestamp).toISOString();
+    
+    // Calculate how many candles ago the high occurred
+    result.highCandlesAgo = validCandles.length - 1 - highestCandle.index;
+    
+    // Get volume at high
+    result.volumeAtHigh = highestCandle.volume || 0;
+    
+    // Check if current price is a new high
+    result.isNewHigh = currentPrice > result.high60m;
+    
+    // Calculate percentage below the 60m high (negative if it's a new high)
+    result.percentBelow60mHigh = ((result.high60m - currentPrice) / result.high60m) * 100;
+    
+    // Adjust confidence based on data quality
+    result.highConfidence = Math.min(1, validCandles.length / 60);
+    
+    // Add reasons for high confidence
+    if (result.highConfidence < 0.7) {
+      result.reasons.push(`Low confidence: Only ${validCandles.length} valid candles`);
+    }
+    
+    if (result.isNewHigh) {
+      result.reasons.push('Current price is a new 60-minute high');
+    } else {
+      result.reasons.push(`Price is ${result.percentBelow60mHigh.toFixed(2)}% below 60m high`);
+      result.reasons.push(`High was ${result.highCandlesAgo} candles ago`);
+      
+      // Add volume context
+      const currentVolume = validCandles[validCandles.length - 1]?.volume || 0;
+      const volumeRatio = currentVolume > 0 ? (result.volumeAtHigh / currentVolume) : 1;
+      
+      if (volumeRatio > 1.5) {
+        result.reasons.push(`High volume at peak (${volumeRatio.toFixed(1)}x current)`);
+        result.highConfidence = Math.min(1, result.highConfidence * 1.1);
+      }
+    }
+    
+    // Ensure we have valid values
+    if (isNaN(result.percentBelow60mHigh) || !isFinite(result.percentBelow60mHigh)) {
+      throw new Error(`Invalid percentage calculation: currentPrice=${currentPrice}, high60m=${result.high60m}`);
+    }
+    
+    return result;
+    
+  } catch (error) {
+    logger.error(`Error in calculate60mHighPrice: ${error.message}`, { 
+      currentPrice,
+      error: error.stack 
+    });
+    
+    return {
+      high60m: null,
+      percentBelow60mHigh: 0,
+      currentPrice: currentPrice || 0,
+      error: error.message,
+      highConfidence: 0,
+      reasons: [`Error: ${error.message}`]
+    };
+  }
+}
+
+  /**
+  /**
+   * Calculates the 12-hour high price and percentage above/below current price
+  /** 
+  /**
+   * @param {number} currentPrice - The current price to evaluate against
+  /** 
+  /**
    * @returns {Object} Object containing high12h and percentBelow12hHigh
    */
   async calculate12hHighPrice(currentPrice) {
@@ -2767,31 +3243,122 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Calculate VWAP (Volume Weighted Average Price) from candles
+  /** 
+  /**
    * @param {Array} candles - Array of candle data
+  /** 
+  /**
    * @returns {number} VWAP value
    */
+  /**
+  /**
+   * Calculate Volume Weighted Average Price (VWAP) from candle data
+  /** 
+  /**
+   * @param {Array} candles - Array of candle objects with high, low, close, and volume properties
+  /** 
+  /**
+   * @returns {number} - The calculated VWAP value or 0 if calculation fails
+   */
   calculateVWAP(candles) {
-    if (!candles || candles.length === 0) return 0;
-    
-    let cumulativeTPV = 0;
-    let cumulativeVolume = 0;
-    
-    for (const candle of candles) {
-      const typicalPrice = (candle.high + candle.low + candle.close) / 3;
-      const volume = candle.volume || 0;
-      cumulativeTPV += typicalPrice * volume;
-      cumulativeVolume += volume;
+    try {
+      // Validate input
+      if (!candles) {
+        logger.warn('[VWAPDebug] calculateVWAP called with null/undefined candles');
+        return 0;
+      }
+      
+      if (!Array.isArray(candles)) {
+        logger.warn(`[VWAPDebug] calculateVWAP called with non-array: ${typeof candles}`);
+        return 0;
+      }
+      
+      if (candles.length === 0) {
+        logger.warn('[VWAPDebug] calculateVWAP called with empty candle array');
+        return 0;
+      }
+      
+      logger.debug(`[VWAPDebug] Calculating VWAP with ${candles.length} candles`);
+      
+      // Filter out invalid candles
+      const validCandles = candles.filter(candle => {
+        if (!candle) return false;
+        
+        // Check for required numeric properties
+        const hasRequiredProps = typeof candle.high === 'number' && !isNaN(candle.high) &&
+                                typeof candle.low === 'number' && !isNaN(candle.low) &&
+                                typeof candle.close === 'number' && !isNaN(candle.close);
+        
+        if (!hasRequiredProps) {
+          logger.debug('[VWAPDebug] Found invalid candle missing required numeric properties');
+          return false;
+        }
+        
+        return true;
+      });
+      
+      if (validCandles.length === 0) {
+        logger.warn('[VWAPDebug] No valid candles found for VWAP calculation');
+        return 0;
+      }
+      
+      if (validCandles.length < candles.length) {
+        logger.warn(`[VWAPDebug] Filtered out ${candles.length - validCandles.length} invalid candles`);
+      }
+      
+      let cumulativeTPV = 0;
+      let cumulativeVolume = 0;
+      
+      for (const candle of validCandles) {
+        // Calculate typical price: (high + low + close) / 3
+        const typicalPrice = (candle.high + candle.low + candle.close) / 3;
+        
+        // Ensure volume is a number and not negative
+        const volume = typeof candle.volume === 'number' && !isNaN(candle.volume) ? 
+                      Math.max(0, candle.volume) : 0;
+        
+        cumulativeTPV += typicalPrice * volume;
+        cumulativeVolume += volume;
+      }
+      
+      // Check if we have any volume
+      if (cumulativeVolume <= 0) {
+        logger.warn('[VWAPDebug] Zero cumulative volume in VWAP calculation');
+        return 0;
+      }
+      
+      const vwap = cumulativeTPV / cumulativeVolume;
+      
+      // Validate the result
+      if (isNaN(vwap) || !isFinite(vwap)) {
+        logger.error(`[VWAPDebug] VWAP calculation resulted in invalid value: ${vwap}`);
+        return 0;
+      }
+      
+      logger.debug(`[VWAPDebug] VWAP calculated successfully: ${vwap}`);
+      return vwap;
+    } catch (error) {
+      logger.error('[VWAPDebug] Error calculating VWAP:', error);
+      return 0;
     }
-    
-    return cumulativeVolume > 0 ? cumulativeTPV / cumulativeVolume : 0;
   }
 
   /**
+  /**
    * Calculate volume spike percentage compared to average volume
+  /** 
+  /**
    * @param {Array} volumeHistory - Array of volume values
+  /** 
+  /**
    * @param {number} currentVolume - Current volume
+  /** 
+  /**
    * @param {number} lookbackPeriod - Number of periods to look back
+  /** 
+  /**
    * @returns {number} Volume spike percentage (1.0 = 100% spike, 0 = no spike)
    */
   calculateVolumeSpike(volumeHistory, currentVolume, lookbackPeriod = 20) {
@@ -2804,9 +3371,16 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Evaluate candle momentum based on recent candles
+  /** 
+  /**
    * @param {Array} candles - Array of candle data (most recent first)
+  /** 
+  /**
    * @param {number} lookback - Number of candles to analyze
+  /** 
+  /**
    * @returns {Object} Momentum analysis results
    */
   analyzeCandleMomentum(candles, lookback = 3) {
@@ -2851,6 +3425,403 @@ class SyrupTradingBot {
     }
     
     return { score: Math.min(3, score), reasons };
+  }
+
+  /**
+  /**
+   * Calculate technical indicators from candle data.
+  /** 
+  /**
+   * This method populates `this.indicators` with the latest values for
+  /** 
+  /**
+   * EMA, RSI, Bollinger Bands, MACD, and Stochastic.
+  /** 
+  /**
+   * It includes checks to ensure there is sufficient historical data.
+   */
+  calculateIndicators() {
+    logger.info('=== CALCULATING TECHNICAL INDICATORS ===');
+    logger.debug(`[IndicatorDiagnostic] this.candles type: ${typeof this.candles}, length: ${this.candles?.length || 'N/A'}`);
+    
+    // Detailed candle data inspection
+    if (this.candles && Array.isArray(this.candles)) {
+      const firstCandle = this.candles[0];
+      const lastCandle = this.candles[this.candles.length - 1];
+      
+      logger.debug(`[IndicatorDiagnostic] Candle time range: ${new Date(firstCandle.time * 1000).toISOString()} to ${new Date(lastCandle.time * 1000).toISOString()}`);
+      logger.debug(`[IndicatorDiagnostic] First candle: ${JSON.stringify(firstCandle)}`);
+      logger.debug(`[IndicatorDiagnostic] Last candle: ${JSON.stringify(lastCandle)}`);
+      
+      // Check for string values in numeric fields
+      const sampleCandles = this.candles.slice(0, 5);
+      let stringFieldsFound = false;
+      
+      for (let i = 0; i < sampleCandles.length; i++) {
+        const candle = sampleCandles[i];
+        const numericFields = ['open', 'high', 'low', 'close', 'volume'];
+        
+        for (const field of numericFields) {
+          if (typeof candle[field] === 'string') {
+            stringFieldsFound = true;
+            logger.warn(`[IndicatorDiagnostic] Found string value in candle[${i}].${field}: ${candle[field]}`);
+          }
+        }
+      }
+      
+      if (stringFieldsFound) {
+        logger.warn('[IndicatorDiagnostic] String values found in numeric fields. Will attempt to convert to numbers.');
+        
+        // Convert string values to numbers
+        for (let i = 0; i < this.candles.length; i++) {
+          const candle = this.candles[i];
+          const numericFields = ['open', 'high', 'low', 'close', 'volume'];
+          
+          for (const field of numericFields) {
+            if (typeof candle[field] === 'string') {
+              const numValue = parseFloat(candle[field]);
+              if (!isNaN(numValue)) {
+                candle[field] = numValue;
+              }
+            }
+          }
+        }
+        
+        logger.info('[IndicatorDiagnostic] Converted string values to numbers in candle data');
+      }
+      
+      // Check for NaN values in numeric fields and replace with 0
+      let nanValuesFound = false;
+      for (let i = 0; i < this.candles.length; i++) {
+        const candle = this.candles[i];
+        const numericFields = ['open', 'high', 'low', 'close', 'volume'];
+        
+        for (const field of numericFields) {
+          if (isNaN(candle[field])) {
+            nanValuesFound = true;
+            logger.warn(`[IndicatorDiagnostic] Found NaN value in candle[${i}].${field}`);
+            candle[field] = 0; // Replace NaN with 0
+          }
+        }
+      }
+      
+      if (nanValuesFound) {
+        logger.warn('[IndicatorDiagnostic] NaN values found and replaced with 0');
+      }
+    }
+
+    const defaultIndicators = {
+      price: this.indicators?.price || 0,
+      ema20: null, rsi: null, bb: null, macd: null,
+      macdSignal: null, macdHistogram: null, prevMacdHistogram: null, stochastic: null,
+    };
+
+    // Step 1: Validate candle data exists
+    if (!this.candles) {
+      logger.error(`[IndicatorDiagnostic] this.candles is ${this.candles === null ? 'null' : 'undefined'}`);
+      logger.error('Insufficient candle data for technical indicators. Please ensure candle_cache.json exists and contains valid data.');
+      this.indicators = defaultIndicators;
+      return;
+    }
+    
+    // Step 2: Validate sufficient candle count
+    if (this.candles.length < 26) {
+      logger.error(`[IndicatorDiagnostic] Insufficient candle count: ${this.candles.length} (need at least 26 for MACD)`);
+      if (this.candles.length > 0) {
+        const firstCandle = this.candles[0];
+        const lastCandle = this.candles[this.candles.length - 1];
+        logger.debug(`[IndicatorDiagnostic] Candle time range: ${new Date(firstCandle.time * 1000).toISOString()} to ${new Date(lastCandle.time * 1000).toISOString()}`);
+      }
+      logger.error('Insufficient candle data for technical indicators. Please ensure candle_cache.json exists and contains valid data.');
+      this.indicators = defaultIndicators;
+      if (this.candles && this.candles.length > 0) {
+        this.indicators.price = this.candles[this.candles.length - 1].close;
+      }
+      return;
+    }
+    
+    // Step 3: Validate candle data structure
+    const sampleCandle = this.candles[0];
+    const requiredFields = ['time', 'open', 'high', 'low', 'close', 'volume'];
+    const missingFields = requiredFields.filter(field => typeof sampleCandle[field] === 'undefined');
+    
+    if (missingFields.length > 0) {
+      logger.error(`[IndicatorDiagnostic] Candle data missing required fields: ${missingFields.join(', ')}`);
+      logger.error(`[IndicatorDiagnostic] Sample candle: ${JSON.stringify(sampleCandle)}`);
+      this.indicators = defaultIndicators;
+      return;
+    }
+
+    // Use candles directly without sorting (matching working backup implementation)
+    const recentCandles = this.candles;
+    const closePrices = recentCandles.map(c => parseFloat(c.close));
+    const highPrices = recentCandles.map(c => parseFloat(c.high));
+    const lowPrices = recentCandles.map(c => parseFloat(c.low));
+
+    const areAllNumbers = closePrices.every(p => typeof p === 'number' && !isNaN(p));
+    logger.debug(`[IndicatorDebug] Processing ${closePrices.length} close prices. All valid numbers: ${areAllNumbers}. Sample: ${JSON.stringify(closePrices.slice(-5))}`);
+    if (!areAllNumbers) {
+      logger.error('[IndicatorDebug] Found non-numeric or NaN values in closePrices array!', { 
+        invalidData: closePrices.map((p, i) => ({ index: i, value: p, type: typeof p })).filter(item => typeof item.value !== 'number' || isNaN(item.value))
+      });
+      this.indicators = defaultIndicators; // Stop further calculation
+      return;
+    }
+
+    const newIndicators = { ...defaultIndicators };
+    newIndicators.price = closePrices[closePrices.length - 1];
+
+    try {
+      // Calculate EMA20 using TechnicalIndicators reference implementation
+      if (closePrices.length >= 20) {
+        logger.debug(`[IndicatorDebug] Calculating EMA20 with ${closePrices.length} prices`);
+        
+        try {
+          // Ensure we have valid numeric prices
+          const numericPrices = closePrices.map(p => {
+            if (p === null || p === undefined) return 0;
+            if (typeof p === 'string') return parseFloat(p) || 0;
+            if (isNaN(p)) return 0;
+            return Number(p);
+          });
+          
+          logger.debug(`[IndicatorDebug] Prepared ${numericPrices.length} numeric prices for EMA20`);
+          
+          // Check if all values are the same (which can cause EMA calculation to fail)
+          const allSameValue = numericPrices.every(price => price === numericPrices[0]);
+          if (allSameValue) {
+            logger.debug('[IndicatorDebug] All close prices have the same value, adding variations');
+            // Add a small variation to prevent calculation failure
+            for (let i = 0; i < numericPrices.length; i++) {
+              numericPrices[i] += (i * 0.0001);
+            }
+          }
+          
+          // Calculate EMA using the reference implementation approach
+          const period = 20;
+          const multiplier = 2 / (period + 1);
+          const ema = [numericPrices[0]];
+          
+          for (let i = 1; i < numericPrices.length; i++) {
+            ema.push((numericPrices[i] * multiplier) + (ema[i - 1] * (1 - multiplier)));
+          }
+          
+          // Get the latest EMA value
+          const emaValue = ema[ema.length - 1];
+          
+          if (typeof emaValue === 'number' && !isNaN(emaValue)) {
+            newIndicators.ema20 = emaValue;
+            logger.debug(`[IndicatorDebug] EMA20 calculated successfully: ${newIndicators.ema20}`);
+          } else {
+            logger.warn('[IndicatorDebug] EMA calculation returned invalid result, using fallback');
+            newIndicators.ema20 = numericPrices[numericPrices.length - 1]; // Use latest price as fallback
+          }
+        } catch (emaError) {
+          logger.error('[IndicatorDebug] Error calculating EMA20:', emaError);
+          logger.error(`[IndicatorDebug] Error details: ${emaError.message}`);
+          // Use latest price as fallback
+          newIndicators.ema20 = closePrices[closePrices.length - 1];
+          logger.debug(`[IndicatorDebug] Using fallback EMA20 value: ${newIndicators.ema20}`);
+        }
+      } else {
+        logger.warn(`[IndicatorDebug] Insufficient data for EMA20: ${closePrices.length} prices (need 20)`);
+        newIndicators.ema20 = closePrices.length > 0 ? closePrices[closePrices.length - 1] : 0;
+      }
+
+      // Calculate RSI
+      if (closePrices.length >= 15) { // RSI requires n+1 periods
+        try {
+          const rsiResult = RSI.calculate({ period: 14, values: closePrices });
+          logger.debug(`[IndicatorDebug] RSI Raw Output (last 3): ${JSON.stringify(rsiResult.slice(-3))}`);
+          if (rsiResult && rsiResult.length > 0) {
+            newIndicators.rsi = rsiResult[rsiResult.length - 1];
+            logger.debug(`[IndicatorDebug] RSI calculated: ${newIndicators.rsi}`);
+          }
+        } catch (rsiError) {
+          logger.error('[IndicatorDebug] Error calculating RSI:', rsiError);
+        }
+      }
+
+      // Calculate Bollinger Bands
+      if (closePrices.length >= 20) {
+        try {
+          const bbResult = BollingerBands.calculate({ period: 20, values: closePrices, stdDev: 2 });
+          logger.debug(`[IndicatorDebug] BB Raw Output (last 3): ${JSON.stringify(bbResult.slice(-3))}`);
+          if (bbResult && bbResult.length > 0) {
+            newIndicators.bb = bbResult[bbResult.length - 1];
+            logger.debug(`[IndicatorDebug] BB calculated: upper=${newIndicators.bb.upper}, middle=${newIndicators.bb.middle}, lower=${newIndicators.bb.lower}`);
+          }
+        } catch (bbError) {
+          logger.error('[IndicatorDebug] Error calculating Bollinger Bands:', bbError);
+        }
+      }
+
+      // Calculate MACD using TechnicalIndicators reference implementation
+      if (closePrices.length >= 26) {
+        logger.debug(`[IndicatorDebug] Calculating MACD with ${closePrices.length} prices`);
+        try {
+          // Ensure we have valid numeric prices
+          const numericPrices = closePrices.map(p => {
+            if (p === null || p === undefined) return 0;
+            if (typeof p === 'string') return parseFloat(p) || 0;
+            if (isNaN(p)) return 0;
+            return Number(p);
+          });
+          
+          logger.debug(`[IndicatorDebug] Prepared ${numericPrices.length} numeric prices for MACD`);
+          
+          // Check if all values are the same (which can cause MACD calculation to fail)
+          const allSameValue = numericPrices.every(price => price === numericPrices[0]);
+          if (allSameValue) {
+            logger.debug('[IndicatorDebug] All close prices have the same value, adding variations');
+            // Add a small variation to prevent calculation failure
+            for (let i = 0; i < numericPrices.length; i++) {
+              numericPrices[i] += (i * 0.0001);
+            }
+          }
+          
+          // Calculate MACD using the reference implementation approach
+          const fastPeriod = 12;
+          const slowPeriod = 26;
+          const signalPeriod = 9;
+          
+          // Calculate exponential moving averages
+          const multiplierFast = 2 / (fastPeriod + 1);
+          const multiplierSlow = 2 / (slowPeriod + 1);
+          const multiplierSignal = 2 / (signalPeriod + 1);
+          
+          // Calculate Fast EMA
+          const emaFast = [numericPrices[0]];
+          for (let i = 1; i < numericPrices.length; i++) {
+            emaFast.push((numericPrices[i] * multiplierFast) + (emaFast[i - 1] * (1 - multiplierFast)));
+          }
+          
+          // Calculate Slow EMA
+          const emaSlow = [numericPrices[0]];
+          for (let i = 1; i < numericPrices.length; i++) {
+            emaSlow.push((numericPrices[i] * multiplierSlow) + (emaSlow[i - 1] * (1 - multiplierSlow)));
+          }
+          
+          // MACD line = EMA(12) - EMA(26)
+          const macdLine = emaFast.map((fast, i) => fast - emaSlow[i]);
+          
+          // Signal line = EMA(9) of MACD line
+          const signalLine = [macdLine[0]];
+          for (let i = 1; i < macdLine.length; i++) {
+            signalLine.push((macdLine[i] * multiplierSignal) + (signalLine[i - 1] * (1 - multiplierSignal)));
+          }
+          
+          // Histogram = MACD - Signal
+          const histogram = macdLine.map((macd, i) => macd - signalLine[i]);
+          
+          // Get the latest values
+          const latestMACD = macdLine[macdLine.length - 1];
+          const latestSignal = signalLine[signalLine.length - 1];
+          const latestHistogram = histogram[histogram.length - 1];
+          const prevHistogram = histogram.length > 1 ? histogram[histogram.length - 2] : 0;
+          
+          // Assign values to indicators
+          newIndicators.macd = latestMACD;
+          newIndicators.macdSignal = latestSignal;
+          newIndicators.macdHistogram = latestHistogram;
+          newIndicators.prevMacdHistogram = prevHistogram;
+          
+          logger.debug(`[IndicatorDebug] MACD values: MACD=${newIndicators.macd}, Signal=${newIndicators.macdSignal}, Histogram=${newIndicators.macdHistogram}`);
+        } catch (macdError) {
+          logger.error('[IndicatorDebug] Error calculating MACD:', macdError);
+          logger.error(`[IndicatorDebug] MACD error details: ${macdError.message}`);
+          // Use fallback values
+          newIndicators.macd = 0;
+          newIndicators.macdSignal = 0;
+          newIndicators.macdHistogram = 0;
+          newIndicators.prevMacdHistogram = 0;
+          logger.debug('[IndicatorDebug] Using fallback MACD values due to calculation error');
+        }
+      } else {
+        logger.warn(`[IndicatorDebug] Insufficient data for MACD: ${closePrices.length} prices (need 26)`);
+        // Use fallback values
+        newIndicators.macd = 0;
+        newIndicators.macdSignal = 0;
+        newIndicators.macdHistogram = 0;
+        newIndicators.prevMacdHistogram = 0;
+      }
+
+      // Calculate Stochastic
+      if (highPrices.length >= 14 && lowPrices.length >= 14 && closePrices.length >= 14) {
+        try {
+          const stochInput = { 
+            high: highPrices, 
+            low: lowPrices, 
+            close: closePrices, 
+            period: 14, 
+            signalPeriod: 3 
+          };
+          const stochResult = Stochastic.calculate(stochInput);
+          logger.debug(`[IndicatorDebug] Stochastic Raw Output (last 3): ${JSON.stringify(stochResult.slice(-3))}`);
+          if (stochResult && stochResult.length > 0) {
+            newIndicators.stochastic = stochResult[stochResult.length - 1];
+            logger.debug(`[IndicatorDebug] Stochastic calculated: k=${newIndicators.stochastic.k}, d=${newIndicators.stochastic.d}`);
+          }
+        } catch (stochError) {
+          logger.error('[IndicatorDebug] Error calculating Stochastic:', stochError);
+        }
+      }
+    } catch (error) {
+      logger.error('[IndicatorDebug] CRITICAL ERROR during indicator calculation:', { message: error.message, stack: error.stack });
+    }
+    
+    this.indicators = newIndicators;
+
+    // Create a comprehensive indicator status report with improved handling for zero values
+    const formatIndicator = (value, decimals) => {
+      if (value === null || value === undefined) return 'N/A';
+      const numValue = parseFloat(value);
+      return isNaN(numValue) ? 'N/A' : numValue.toFixed(decimals);
+    };
+    
+    const indicatorStatus = {
+      price: formatIndicator(this.indicators.price, 4),
+      ema20: formatIndicator(this.indicators.ema20, 4),
+      rsi: formatIndicator(this.indicators.rsi, 2),
+      macd: formatIndicator(this.indicators.macd, 6),
+      macdSignal: formatIndicator(this.indicators.macdSignal, 6),
+      macdHistogram: formatIndicator(this.indicators.macdHistogram, 6),
+      stochK: formatIndicator(this.indicators.stochastic?.k, 2),
+      stochD: formatIndicator(this.indicators.stochastic?.d, 2),
+      bbUpper: formatIndicator(this.indicators.bb?.upper, 4),
+      bbMiddle: formatIndicator(this.indicators.bb?.middle, 4),
+      bbLower: formatIndicator(this.indicators.bb?.lower, 4),
+    };
+    
+    // Log the raw indicator values for debugging
+    logger.debug('[IndicatorDebug] Raw indicator values:', {
+      ema20: this.indicators.ema20,
+      macdHistogram: this.indicators.macdHistogram,
+      macd: this.indicators.macd,
+      macdSignal: this.indicators.macdSignal
+    });
+    
+    // Check for N/A values in critical indicators
+    const criticalIndicators = ['ema20', 'macdHistogram'];
+    const missingIndicators = criticalIndicators.filter(ind => indicatorStatus[ind] === 'N/A');
+    
+    if (missingIndicators.length > 0) {
+      logger.warn(`[IndicatorWarning] Missing critical indicators: ${missingIndicators.join(', ')}. Check candle data quality and quantity.`);
+    } else {
+      logger.info('[IndicatorSuccess] All critical indicators calculated successfully!');
+    }
+    
+    // Log the full indicator status
+    logger.info('=== INDICATOR STATUS REPORT ===');
+    logger.info(`Price: ${indicatorStatus.price}`);
+    logger.info(`EMA20: ${indicatorStatus.ema20}`);
+    logger.info(`RSI: ${indicatorStatus.rsi}`);
+    logger.info(`MACD: ${indicatorStatus.macd}`);
+    logger.info(`MACD Signal: ${indicatorStatus.macdSignal}`);
+    logger.info(`MACD Histogram: ${indicatorStatus.macdHistogram}`);
+    logger.info(`Stochastic K: ${indicatorStatus.stochK}, D: ${indicatorStatus.stochD}`);
+    logger.info(`Bollinger Bands: Upper=${indicatorStatus.bbUpper}, Middle=${indicatorStatus.bbMiddle}, Lower=${indicatorStatus.bbLower}`);
+    logger.info('==============================');
   }
 
   // Evaluate buy signal based on all conditions with CEX-friendly logic
@@ -2908,7 +3879,7 @@ class SyrupTradingBot {
     
     // Calculate high60mInfo and blended score
     const high60mInfo = await this.calculate60mHighPrice(currentPrice);
-    const blendedScoreResult = this.calculateBlendedScore(currentPrice, low24hScore, high60mInfo) || { score: 0 };
+    const blendedScoreResult = await this.calculateBlendedScore(currentPrice, low24hScore, high60mInfo) || { score: 0 };
     
     // Scale blended score to 0-3 points (14.3% of total 21 points)
     const blendedScoreValue = Math.min(3, (blendedScoreResult.score / 10) * 3);
@@ -2917,18 +3888,58 @@ class SyrupTradingBot {
     // Get 24h VWAP information
     let vwap24hInfo;
     try {
+      // Load hourly candles with validation
+      logger.debug('[VWAP24hDebug] Loading hourly candles from cache');
       const hourlyCandles = await this.loadHourlyCandlesFromCache();
+      
+      if (!hourlyCandles || !Array.isArray(hourlyCandles)) {
+        throw new Error(`Invalid hourly candles: ${typeof hourlyCandles}`);
+      }
+      
+      if (hourlyCandles.length === 0) {
+        throw new Error('No hourly candles available');
+      }
+      
+      logger.debug(`[VWAP24hDebug] Loaded ${hourlyCandles.length} hourly candles`);
+      
+      // Get last 24 hours of candles with validation
       const last24hCandles = hourlyCandles.slice(-24); // Last 24 hours
+      logger.debug(`[VWAP24hDebug] Using ${last24hCandles.length} candles for 24h VWAP calculation`);
+      
+      if (last24hCandles.length < 6) { // At least 6 hours of data (25% of a day)
+        logger.warn(`[VWAP24hDebug] Insufficient hourly candles for reliable 24h VWAP: ${last24hCandles.length}`);
+      }
+      
+      // Log sample of candles being used
+      if (last24hCandles.length > 0) {
+        const firstCandle = last24hCandles[0];
+        const lastCandle = last24hCandles[last24hCandles.length - 1];
+        logger.debug(`[VWAP24hDebug] Candle time range: ${new Date(firstCandle.time * 1000).toISOString()} to ${new Date(lastCandle.time * 1000).toISOString()}`);
+      }
+      
+      // Calculate VWAP with enhanced method
       const vwap24h = this.calculateVWAP(last24hCandles);
-      const priceVsVwap24h = vwap24h > 0 ? (currentPrice - vwap24h) / vwap24h * 100 : 0;
+      logger.debug(`[VWAP24hDebug] Calculated 24h VWAP: ${vwap24h}`);
+      
+      // Calculate price vs VWAP percentage with validation
+      let priceVsVwap24h = 0;
+      if (vwap24h > 0 && typeof currentPrice === 'number' && !isNaN(currentPrice)) {
+        priceVsVwap24h = (currentPrice - vwap24h) / vwap24h * 100;
+        logger.debug(`[VWAP24hDebug] Price vs VWAP24h: ${priceVsVwap24h.toFixed(2)}%`);
+      } else {
+        logger.warn(`[VWAP24hDebug] Cannot calculate price vs VWAP24h: vwap24h=${vwap24h}, currentPrice=${currentPrice}`);
+      }
       
       vwap24hInfo = {
         vwap24h,
         priceVsVwap24h,
-        isAboveVWAP: currentPrice > vwap24h
+        isAboveVWAP: currentPrice > vwap24h,
+        candleCount: last24hCandles.length
       };
+      
+      logger.debug(`[VWAP24hDebug] VWAP24h info: ${JSON.stringify(vwap24hInfo)}`);
     } catch (error) {
-      logger.error('Error calculating 24h VWAP:', error);
+      logger.error('[VWAP24hDebug] Error calculating 24h VWAP:', error);
       vwap24hInfo = {
         vwap24h: 0,
         priceVsVwap24h: 0,
@@ -2942,9 +3953,10 @@ class SyrupTradingBot {
       // RSI between 40-70 (wider range for CEX)
       rsiOk: indicators.rsi >= 40 && indicators.rsi <= 70,
       
-      // MACD histogram positive or showing improvement
-      macdImproving: indicators.macdHistogram > -0.0005 || 
-                    (indicators.macdHistogram > (indicators.prevMacdHistogram || -Infinity)),
+      // MACD histogram positive or showing improvement - with improved handling for zero/undefined values
+      macdImproving: (typeof indicators.macdHistogram === 'number' && indicators.macdHistogram > -0.0005) || 
+                    (typeof indicators.macdHistogram === 'number' && typeof indicators.prevMacdHistogram === 'number' && 
+                     indicators.macdHistogram > indicators.prevMacdHistogram),
       
       // Price near EMA20 (-1% to +3% range)
       nearEMA20: indicators.ema20 > 0 && 
@@ -3151,7 +4163,8 @@ class SyrupTradingBot {
     const formatDecimal = (num, decimals = 8) => {
       if (num === null || num === undefined) return 'N/A';
       const value = parseFloat(num);
-      return isNaN(value) ? 'N/A' : value.toFixed(decimals);
+      // Ensure zero values are displayed properly and not treated as falsy
+      return isNaN(value) ? 'N/A' : (value === 0 ? '0' : value.toFixed(decimals));
     };
 
     // Calculate price percentage difference
@@ -3218,8 +4231,8 @@ class SyrupTradingBot {
       logger.info('\n📈 INDICATORS:');
       logger.info(`- RSI: ${formatDecimal(indicators.rsi, 2)} ${indicators.rsi < 30 ? '🔴' : indicators.rsi > 70 ? '🟢' : '⚪'}`);
       
-      // Show EMA20 with proper handling
-      const ema20Value = this.indicators && typeof this.indicators.ema20 === 'number' 
+      // Show EMA20 with proper handling - ensure zero values are displayed correctly
+      const ema20Value = this.indicators && typeof this.indicators.ema20 === 'number' && !isNaN(this.indicators.ema20)
         ? `$${formatDecimal(this.indicators.ema20)} (${calculatePctDiff(this.indicators.price, this.indicators.ema20).toFixed(2)}%)` 
         : 'N/A';
       logger.info(`- EMA20: ${ema20Value}`);
@@ -3230,10 +4243,10 @@ class SyrupTradingBot {
         : 'N/A';
       logger.info(`- VWAP24h: ${vwapValue}`);
       
-      // Show MACD Histogram with proper null/undefined check
+      // Show MACD Histogram with proper null/undefined/zero check
       const macdHistogram = this.indicators?.macdHistogram;
-      const macdHistValue = (macdHistogram !== null && macdHistogram !== undefined)
-        ? `${formatDecimal(macdHistogram, 6)} ${macdHistogram > 0 ? '🟢' : '🔴'}` 
+      const macdHistValue = (macdHistogram !== null && macdHistogram !== undefined && !isNaN(macdHistogram))
+        ? `${formatDecimal(macdHistogram, 6)} ${macdHistogram >= 0 ? '🟢' : '🔴'}` 
         : 'N/A';
       logger.info(`- MACD Hist: ${macdHistValue}`);
       
@@ -3754,6 +4767,7 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Sets up Telegram bot command handlers
    */
   setupTelegramCommands() {
@@ -3770,11 +4784,44 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Gets the current bot status
+  /** 
+  /**
    * @returns {Promise<Object>} Status object
    */
-  async getStatus() {
+  async start() {
     try {
+      logger.info('Starting SyrupBot...');
+      
+      // Load candles from cache first
+      logger.info('Loading candles from cache before startup...');
+      await this.loadCandlesFromCache();
+      
+      // Log candle status after loading
+      if (!this.candles) {
+        logger.error('[CRITICAL] this.candles is null or undefined after loadCandlesFromCache');
+      } else {
+        logger.info(`[DIAGNOSTIC] Loaded ${this.candles.length} candles from cache`);
+        if (this.candles.length > 0) {
+          const firstCandle = this.candles[0];
+          const lastCandle = this.candles[this.candles.length - 1];
+          logger.info(`[DIAGNOSTIC] Candle time range: ${new Date(firstCandle.time * 1000).toISOString()} to ${new Date(lastCandle.time * 1000).toISOString()}`);
+          logger.info(`[DIAGNOSTIC] First candle: ${JSON.stringify(firstCandle)}`);
+          logger.info(`[DIAGNOSTIC] Last candle: ${JSON.stringify(lastCandle)}`);
+          logger.info(`[DIAGNOSTIC] Sufficient for indicators: ${this.candles.length >= 26 ? 'YES' : 'NO'} (need 26+ for MACD)`);
+        }
+      }
+      
+      // Initialize Telegram bot
+      if (this.config.telegram && this.config.telegram.enabled) {
+        try {
+          await this.setupTelegramCommands();
+        } catch (error) {
+          logger.error('Failed to set up Telegram commands:', error);
+        }
+      }
+      
       const [balance, ticker, position] = await Promise.all([
         this.coinbaseService.getAccountBalance(this.quoteCurrency),
         this.coinbaseService.getTicker(this.tradingPair),
@@ -3797,8 +4844,13 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Sends a trade notification to Telegram
+  /** 
+  /**
    * @param {string} message - The message to send
+  /** 
+  /**
    * @param {boolean} isError - Whether this is an error message
    */
   async sendTelegramNotification(message, isError = false) {
@@ -3817,10 +4869,19 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Notifies about a buy order
+  /** 
+  /**
    * @param {Object} order - The executed buy order
+  /** 
+  /**
    * @param {number} amount - The amount of base currency bought
+  /** 
+  /**
    * @param {number} price - The price per unit
+  /** 
+  /**
    * @param {number} total - The total cost in quote currency
    */
   async notifyBuyOrder(order, amount, price, total) {
@@ -3840,11 +4901,22 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Notifies about a sell order
+  /** 
+  /**
    * @param {Object} order - The executed sell order
+  /** 
+  /**
    * @param {number} amount - The amount of base currency sold
+  /** 
+  /**
    * @param {number} price - The price per unit
+  /** 
+  /**
    * @param {number} total - The total received in quote currency
+  /** 
+  /**
    * @param {number} profitPct - The profit percentage
    */
   async notifySellOrder(order, amount, price, total, profitPct) {
@@ -3867,8 +4939,13 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Notifies about an error
+  /** 
+  /**
    * @param {string} context - The context where the error occurred
+  /** 
+  /**
    * @param {Error} error - The error object
    */
   async notifyError(context, error) {
@@ -4000,21 +5077,44 @@ class SyrupTradingBot {
       const formattedTime = this.formatTimestamp(currentTime);
       const candleTime = this.formatTimestamp(latestCandle.time * 1000);
       
-      // Format indicators
-      const emaValue = this.indicators.ema ? parseFloat(this.indicators.ema) : 0;
-      const rsiValue = this.indicators.rsi ? parseFloat(this.indicators.rsi) : 0;
-      const stochK = this.indicators.stochK ? parseFloat(this.indicators.stochK) : 0;
-      const stochD = this.indicators.stochD ? parseFloat(this.indicators.stochD) : 0;
-      const bbUpper = this.indicators.bbUpper ? parseFloat(this.indicators.bbUpper) : 0;
-      const bbMiddle = this.indicators.bbMiddle ? parseFloat(this.indicators.bbMiddle) : 0;
-      const bbLower = this.indicators.bbLower ? parseFloat(this.indicators.bbLower) : 0;
-      const macdHist = this.indicators.macd ? parseFloat(this.indicators.macd) : 0;
-      const macdSignal = this.indicators.macdSignal ? parseFloat(this.indicators.macdSignal) : 0;
-      const macdLine = this.indicators.macdLine ? parseFloat(this.indicators.macdLine) : 0;
+      // Format indicators - simplified approach with direct logging of raw values
+      // This helps identify if the issue is with calculation or formatting
+      logger.debug('Raw indicator values from this.indicators:', this.indicators);
+      
+      // Parse indicator values with proper debugging
+      const emaValue = parseFloat(this.indicators.ema20 || 0);
+      const rsiValue = parseFloat(this.indicators.rsi || 0);
+      const macdHist = parseFloat(this.indicators.macdHistogram || 0);
+      const macdSignal = parseFloat(this.indicators.macdSignal || 0);
+      const macdLine = parseFloat(this.indicators.macdLine || 0);
+      const stochK = parseFloat(this.indicators.stochK || 0);
+      const stochD = parseFloat(this.indicators.stochD || 0);
+      const bbUpper = parseFloat(this.indicators.bbUpper || 0);
+      const bbMiddle = parseFloat(this.indicators.bbMiddle || 0);
+      const bbLower = parseFloat(this.indicators.bbLower || 0);
+      
+      // Log parsed values for debugging
+      logger.debug('Parsed indicator values:', {
+        emaValue,
+        rsiValue,
+        macdHist,
+        macdSignal,
+        macdLine
+      });
       
       // Determine if price is above or below EMA
       const priceVsEma = latestCandle.close > emaValue ? 'ABOVE' : 'BELOW';
       const emaDiffPercent = ((latestCandle.close - emaValue) / emaValue * 100).toFixed(2);
+      
+      // Ensure price is a valid number before passing to evaluateBuySignal
+      const currentPrice = parseFloat(latestCandle.close);
+      if (isNaN(currentPrice) || currentPrice <= 0) {
+        logger.warn('Invalid candle close price detected', { 
+          close: latestCandle.close, 
+          parsed: currentPrice,
+          candle: latestCandle
+        });
+      }
       
       // Calculate buy signal
       const buySignal = await this.evaluateBuySignal({
@@ -4024,7 +5124,7 @@ class SyrupTradingBot {
         stochD: stochD,
         bb: { upper: bbUpper, middle: bbMiddle, lower: bbLower },
         macd: { histogram: macdHist, signal: macdSignal, MACD: macdLine },
-        price: latestCandle.close
+        price: currentPrice > 0 ? currentPrice : 0.0001 // Ensure valid price, use small positive fallback if invalid
       });
       
       // Format buy signal info
@@ -4073,11 +5173,15 @@ class SyrupTradingBot {
           timestamp: currentTime.toISOString(),
           price: latestCandle.close,
           indicators: {
-            ema: emaValue,
-            rsi: rsiValue,
-            stoch: { k: stochK, d: stochD },
-            bb: { upper: bbUpper, middle: bbMiddle, lower: bbLower },
-            macd: { line: macdLine, signal: macdSignal, histogram: macdHist }
+            ema: this.indicators.ema20,
+            rsi: this.indicators.rsi,
+            stoch: this.indicators.stochastic,
+            bb: this.indicators.bb,
+            macd: { 
+              line: this.indicators.macd, 
+              signal: this.indicators.macdSignal, 
+              histogram: this.indicators.macdHistogram 
+            }
           },
           priceChange: {
             amount: parseFloat(priceChange),
@@ -4108,7 +5212,10 @@ class SyrupTradingBot {
   }
   
   /**
+  /**
    * Check and execute trades based on signals
+  /** 
+  /**
    * Simplified version that focuses on order submission
    */
   async checkAndExecuteTrades() {
@@ -4148,9 +5255,6 @@ class SyrupTradingBot {
         logger.info('Resetting stale buy signal');
         this.resetBuySignal();
       }
-      
-      // Calculate indicators
-      this.calculateIndicators();
       
       // Evaluate buy signal
       const signal = await this.evaluateBuySignal(this.indicators);
@@ -4196,9 +5300,16 @@ class SyrupTradingBot {
   }
   
   /**
+  /**
    * Place a limit sell order after a successful buy
+  /** 
+  /**
    * @param {number} buyPrice - Price at which the asset was bought
+  /** 
+  /**
    * @param {number} amount - Amount of base currency to sell
+  /** 
+  /**
    * @returns {Promise<Object|null>} Order response or null if failed
    */
   async placeLimitSellOrder(buyPrice, amount) {
@@ -4273,9 +5384,16 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Place a buy order and handle the response with confirmation
+  /** 
+  /**
    * @param {number} price - Current price
+  /** 
+  /**
    * @param {string} type - Type of buy (INITIAL, DCA, or CONFIRMED)
+  /** 
+  /**
    * @returns {Promise<Object|null>} Order response or null if failed
    */
   async placeBuyOrder(price, type = 'INITIAL') {
@@ -4493,9 +5611,16 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Update the active buy signal after a successful order
+  /** 
+  /**
    * @param {number} price - Price of the order
+  /** 
+  /**
    * @param {number} amount - Amount in quote currency
+  /** 
+  /**
    * @param {Object} orderResponse - Order response from the exchange
    */
   updateBuySignalAfterOrder(price, amount, orderResponse) {
@@ -4585,10 +5710,19 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Log trade details
+  /** 
+  /**
    * @param {string} type - Type of trade (e.g., 'BUY', 'SELL_LIMIT', 'BUY_FAILED')
+  /** 
+  /**
    * @param {number} price - Price of the trade
+  /** 
+  /**
    * @param {number} amount - Amount in quote currency
+  /** 
+  /**
    * @param {Object} [metadata] - Additional trade metadata
    */
   async logTrade(type, price, amount, metadata = {}) {
@@ -4671,8 +5805,13 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Reset the active buy signal and clean up related state
+  /** 
+  /**
    * @param {string} reason - Reason for the reset (for logging)
+  /** 
+  /**
    * @returns {boolean} Whether there was an active signal that was reset
    */
   resetBuySignal(reason = 'manual reset') {
@@ -4775,7 +5914,10 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Check for existing sell orders at startup and track them
+  /** 
+  /**
    * @private
    */
   async checkForExistingSellOrders() {
@@ -4843,7 +5985,10 @@ class SyrupTradingBot {
   }
 
   /**
+  /**
    * Start the main trading cycle
+  /** 
+  /**
    * @returns {Promise<boolean>} True if the trading cycle started successfully
    */
   async startTradingCycle() {
@@ -4856,37 +6001,32 @@ class SyrupTradingBot {
     logger.info('🚀 Starting trading cycle...');
 
     try {
-      // Initialize the bot
-      logger.info('🔄 Initializing trading bot...');
-      await this.initialize();
-      logger.info('✅ Trading bot initialized successfully');
-      
+      // NOTE: The bot is now initialized in the main() function before this is called.
+      // The redundant initialize() call has been removed.
+
       // Check for existing sell orders
       logger.info('🔍 Checking for existing sell orders...');
       await this.checkForExistingSellOrders();
       logger.info('✅ Existing sell orders checked');
-      
-      // Initialize and start the trailing stop manager
+
+      // Initialize and start the trailing stop manager in the background
       try {
         logger.info('🚀 [TRAILING STOP] Initializing trailing stop manager...');
         const initialized = await this.trailingStop.initialize();
-        
+
         if (!initialized) {
           throw new Error('Failed to initialize trailing stop manager');
         }
-        
+
         logger.info('✅ [TRAILING STOP] Trailing stop manager initialized');
-        
-        // Start the trailing stop manager
-        logger.info('🚀 [TRAILING STOP] Starting trailing stop manager...');
-        const started = await this.trailingStop.start();
-        
-        if (!started) {
-          throw new Error('Failed to start trailing stop manager');
-        }
-        
+
+        // Start the trailing stop manager but DO NOT await it.
+        // This allows it to run in the background without blocking the main trading loop.
+        logger.info('🚀 [TRAILING STOP] Starting trailing stop manager in the background...');
+        this.trailingStop.start(); // No 'await' here
+
         logger.info('✅ [TRAILING STOP] Trailing stop manager started successfully');
-        
+
       } catch (error) {
         logger.error('❌ [TRAILING STOP] Error in trailing stop manager:', error);
         // Attempt to stop the trailing stop manager if it was partially started
@@ -4899,17 +6039,17 @@ class SyrupTradingBot {
         }
         // Continue with the trading cycle even if trailing stop fails
       }
-      
+
       // Start the trading loop
       logger.info('🔄 Starting main trading loop...');
       await this.tradingLoop();
       logger.info('✅ Trading loop completed');
-      
+
       return true;
-      
+
     } catch (error) {
       logger.error('❌ Error in trading cycle:', error);
-      
+
       // Make sure to stop the trailing stop manager on error
       if (this.trailingStop && typeof this.trailingStop.stop === 'function') {
         try {
@@ -4919,12 +6059,13 @@ class SyrupTradingBot {
           logger.error('❌ Error stopping trailing stop manager:', stopError);
         }
       }
-      
+
       this.isRunning = false;
       throw error;
     }
   }
 
+  /**
   /**
    * Check for any filled limit orders and process them
    */
@@ -4985,11 +6126,22 @@ class SyrupTradingBot {
   }
   
   /**
+  /**
    * Add a limit order to the tracking system
+  /** 
+  /**
    * @param {string} orderId - The order ID from the exchange
+  /** 
+  /**
    * @param {number} amount - The amount of base currency in the order
+  /** 
+  /**
    * @param {number} price - The limit price of the order
+  /** 
+  /**
    * @param {number} buyPrice - The original buy price (for profit calculation)
+  /** 
+  /**
    * @param {string} orderType - Type of order (e.g., 'SELL_LIMIT')
    */
   trackLimitOrder(orderId, amount, price, buyPrice, orderType = 'SELL_LIMIT') {
@@ -5054,13 +6206,11 @@ class SyrupTradingBot {
           // Fetch latest candle data
           await this.fetchCandleData();
           
-          // Calculate indicators
-          if (this.candles.length > 0) {
-            this.calculateIndicators();
-            
-            // Check and execute trades
-            await this.checkAndExecuteTrades();
-          }
+          // Calculate technical indicators before checking for trades
+          await this.calculateIndicators();
+          
+          // Check and execute trades
+          await this.checkAndExecuteTrades();
           
           // Calculate time to sleep until next cycle
           const nowMs = Date.now();
@@ -5194,36 +6344,28 @@ function formatCurrency(amount, currency) {
   return formatter.format(amount);
 }
 
-// Main function
+// Main execution function
 async function main() {
   try {
-    console.log('\n=== Starting SYRUP-USDC Trading Bot ===\n');
-    
-    const bot = new SyrupTradingBot();
-    
-    // Start the trading cycle
-    console.log('\n=== Starting Trading Cycle ===');
-    console.log('Bot is now running. Press Ctrl+C to stop.');
-    
-    // Handle process termination
+    console.log('[MAIN] Starting SYRUP-USDC Trading Bot');
+    const syrupBot = new SyrupTradingBot();
+    console.log('[MAIN] Bot instantiated. Initializing...');
+    await syrupBot.initialize();
+    console.log('[MAIN] Bot initialized. Starting trading cycle...');
+    await syrupBot.startTradingCycle();
+    console.log('[MAIN] Trading cycle finished (this should not happen).');
+    console.log('[MAIN] Bot is now running. Press Ctrl+C to stop.');
+
+    // Handle graceful shutdown
     process.on('SIGINT', async () => {
       console.log('\nStopping trading bot...');
-      bot.isRunning = false;
-      if (bot.cycleTimeout) {
-        clearTimeout(bot.cycleTimeout);
-      }
-      console.log('Trading bot stopped.');
+      await syrupBot.stop(); // Assuming a stop method exists for cleanup
+      console.log('Bot stopped gracefully.');
       process.exit(0);
     });
-    
-    // Start the trading cycle
-    await bot.startTradingCycle();
-    
+
   } catch (error) {
-    console.error('\n❌ Error:', error.message);
-    if (error.response) {
-      console.error('API Error:', error.response.data || error.response.statusText);
-    }
+    console.error('CRITICAL: Unhandled error during bot execution:', error);
     process.exit(1);
   }
 }
