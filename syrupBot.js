@@ -2765,23 +2765,21 @@ class SyrupTradingBot {
       const percentBelow60mHigh = high60mData.percentBelow60mHigh || 0;
       let high60mScore = 0;
       
-      // Calculate 60m high score (0-10 scale) - Even more sensitive to smaller dips
+      // Calculate 60m high score (0-10 scale) - More conservative, requiring deeper dips
       if (percentBelow60mHigh < 0) {
-        high60mScore = 2;  // New high (increased from 1 to 2)
-      } else if (percentBelow60mHigh <= 0.15) { // Ultra sensitive (was 0.25)
-        high60mScore = 3;  // Within 0.15% of high (increased from 2 to 3)
-      } else if (percentBelow60mHigh <= 0.5) { // More sensitive (was 0.75)
-        high60mScore = 5;  // 0.15-0.5% below (increased from 3 to 5)
-      } else if (percentBelow60mHigh <= 1.0) { // More sensitive (was 1.25)
-        high60mScore = 7;  // 0.5-1.0% below (increased from 4 to 7)
-      } else if (percentBelow60mHigh <= 1.5) { // More sensitive (was 1.75)
-        high60mScore = 8;  // 1.0-1.5% below (increased from 5 to 8)
-      } else if (percentBelow60mHigh <= 2.0) { // More sensitive (was 2.25)
-        high60mScore = 9;  // 1.5-2.0% below (increased from 6 to 9)
-      } else if (percentBelow60mHigh <= 3.0) { // No change in threshold
-        high60mScore = 10; // 2.0-3.0% below (increased from 8 to 10)
+        high60mScore = 0;  // New high - don't buy at new highs (reduced from 2 to 0)
+      } else if (percentBelow60mHigh <= 0.5) { // Small dip, not worth buying
+        high60mScore = 1;  // Within 0.5% of high (reduced from 3-5 to 1)
+      } else if (percentBelow60mHigh <= 1.5) { // Moderate dip
+        high60mScore = 3;  // 0.5-1.5% below (reduced from 7-8 to 3)
+      } else if (percentBelow60mHigh <= 3.0) { // Significant dip
+        high60mScore = 6;  // 1.5-3.0% below (reduced from 9-10 to 6)
+      } else if (percentBelow60mHigh <= 5.0) { // Large dip
+        high60mScore = 8;  // 3.0-5.0% below (reduced from 10 to 8)
+      } else if (percentBelow60mHigh <= 8.0) { // Very large dip
+        high60mScore = 10; // 5.0-8.0% below (no change)
       } else {
-        high60mScore = 10; // More than 3.0% below (no change in score)
+        high60mScore = 10; // More than 8.0% below (no change in score)
       }
       
       // Ensure the score is within valid range (0-10)
@@ -4043,8 +4041,8 @@ class SyrupTradingBot {
       logger.warn('Score validation failed - check component calculations');
     }
     
-    // Set buy threshold (55% of 21 = ~11.55, rounded to 12)
-    const buyThreshold = Math.ceil(21 * 0.47); // 10 points - adjusted for more responsive buying
+    // Set buy threshold (57% of 21 = ~12)
+    const buyThreshold = Math.ceil(21 * 0.57); // 12 points - adjusted for more conservative buying
     const isBuySignal = totalScore >= buyThreshold;
     
     // Log score component details for debugging
