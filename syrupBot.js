@@ -2660,11 +2660,11 @@ class SyrupTradingBot {
           throw new Error('No valid daily candles found for 24h average high calculation');
         }
         
-        // Calculate average of all daily highs as fallback
-        const sum = validDailyCandles.reduce((sum, candle) => sum + candle.high, 0);
-        avgHigh24h = sum / validDailyCandles.length;
+        // Calculate maximum of all daily highs as fallback
+        const highs = validDailyCandles.map(c => c.high);
+        avgHigh24h = Math.max(...highs);
       } else {
-        // Use hourly candles for 24h average high calculation
+        // Use hourly candles for 24h high (maximum) calculation
         const validHourlyCandles = this.hourlyCandles
           .slice(-24) // Only use the last 24 hours
           .filter(candle => 
@@ -2675,9 +2675,9 @@ class SyrupTradingBot {
           throw new Error('No valid hourly candles found for 24h average high calculation');
         }
         
-        // Calculate the average of the last 24 hourly highs
-        const sum = validHourlyCandles.reduce((sum, candle) => sum + candle.high, 0);
-        avgHigh24h = sum / validHourlyCandles.length;
+        // Calculate the maximum high of the last 24 hourly candles
+        const highs = validHourlyCandles.map(c => c.high);
+        avgHigh24h = Math.max(...highs);
       }
       
       // Ensure we have a valid avgHigh24h before proceeding
@@ -2726,7 +2726,7 @@ class SyrupTradingBot {
   /**
    * @returns {Promise<Object>} Object containing blended score and component scores
    */
-  async calculateBlendedScore(currentPrice, low24hScoreResult = null, high60mData = null) {
+  async calculateBlendedScore(currentPrice, low24hScoreResult = null, high24hData = null) {
     const logPrefix = '[calculateBlendedScore]';
     logger.debug(`${logPrefix} === START ===`);
     logger.debug(`${logPrefix} Input - currentPrice: ${currentPrice}, type: ${typeof currentPrice}`);
@@ -2741,7 +2741,7 @@ class SyrupTradingBot {
         logger.error(`${logPrefix} ${errorMsg}`);
         throw new Error(errorMsg);
       }
-
+  
       // Calculate 24h low score if not provided
       let low24hScore = 0;
       if (low24hScoreResult?.score !== undefined) {
@@ -2756,110 +2756,62 @@ class SyrupTradingBot {
       // Ensure the score is within valid range (0-10)
       low24hScore = Math.max(0, Math.min(10, low24hScore));
       
-      // Get or calculate 60m high data
-      if (!high60mData) {
-        high60mData = await this.calculate60mHighPrice(currentPrice);
+      // Get or calculate 24h high data
+      if (!high24hData) {
+        high24hData = await this.calculate24hHighPrice(currentPrice);
       }
-      
-      // Extract percent below 60m high and calculate score
-      const percentBelow60mHigh = high60mData.percentBelow60mHigh || 0;
-      let high60mScore = 0;
-      
-      // Calculate 60m high score (0-10 scale) - More conservative, requiring deeper dips
-      if (percentBelow60mHigh < 0) {
-        high60mScore = 0;  // New high - don't buy at new highs (reduced from 2 to 0)
-      } else if (percentBelow60mHigh <= 0.5) { // Small dip, not worth buying
-        high60mScore = 1;  // Within 0.5% of high (reduced from 3-5 to 1)
-      } else if (percentBelow60mHigh <= 1.5) { // Moderate dip
-        high60mScore = 3;  // 0.5-1.5% below (reduced from 7-8 to 3)
-      } else if (percentBelow60mHigh <= 3.0) { // Significant dip
-        high60mScore = 6;  // 1.5-3.0% below (reduced from 9-10 to 6)
-      } else if (percentBelow60mHigh <= 5.0) { // Large dip
-        high60mScore = 8;  // 3.0-5.0% below (reduced from 10 to 8)
-      } else if (percentBelow60mHigh <= 8.0) { // Very large dip
-        high60mScore = 10; // 5.0-8.0% below (no change)
+  
+      const percentBelow24hHigh = high24hData.percentBelow24hHigh || 0;
+      let high24hScore = 0;
+  
+      // Calculate 24h high score (0-10 scale)
+      if (percentBelow24hHigh < 0) {
+        high24hScore = 0;  // New high - don't buy at new highs
+      } else if (percentBelow24hHigh <= 0.5) {
+        high24hScore = 1;  // Within 0.5% of high
+      } else if (percentBelow24hHigh <= 1.5) {
+        high24hScore = 3;  // 0.5-1.5% below
+      } else if (percentBelow24hHigh <= 3.0) {
+        high24hScore = 6;  // 1.5-3.0% below
+      } else if (percentBelow24hHigh <= 5.0) {
+        high24hScore = 8;  // 3.0-5.0% below
       } else {
-        high60mScore = 10; // More than 8.0% below (no change in score)
+        high24hScore = 10; // More than 5.0% below
       }
       
-      // Ensure the score is within valid range (0-10)
-      high60mScore = Math.max(0, Math.min(10, high60mScore));
+      high24hScore = Math.max(0, Math.min(10, high24hScore));
       
-      // Adjust weights to heavily favor 60m high score for maximum responsiveness
-      let low24hWeight = 0.3;  // Further reduced from 0.4 to 0.3 (30% weight for 24h low)
-      let high60mWeight = 0.7; // Further increased from 0.6 to 0.7 (70% weight for 60m high)
-      
-      // If we have indicators available, adjust weights dynamically
-      if (this.indicators && 
-          typeof this.indicators.bbUpper === 'number' && 
-          typeof this.indicators.bbLower === 'number' &&
-          typeof this.indicators.bbMiddle === 'number' &&
-          this.indicators.bbMiddle !== 0) {
-            
-        try {
-          const { bbUpper, bbLower, bbMiddle } = this.indicators;
-          const bbWidth = (bbUpper - bbLower) / bbMiddle; // Bollinger Band width as volatility indicator
-          
-          // In high volatility (trending) markets, increase 60m high weight
-          if (bbWidth > 0.03) { // Wider bands indicate higher volatility
-            high60mWeight = Math.min(0.7, high60mWeight + 0.2); // Cap at 70% weight
-            low24hWeight = 1 - high60mWeight;
-          }
-          // In low volatility (ranging) markets, increase 24h low weight
-          else if (bbWidth < 0.01) {
-            low24hWeight = Math.min(0.8, low24hWeight + 0.2); // Cap at 80% weight
-            high60mWeight = 1 - low24hWeight;
-          }
-        } catch (e) {
-          logger.warn('Error calculating dynamic weights, using defaults', { error: e.message });
-        }
-      }
+      // Set weights (70% to high score, 30% to low score)
+      const low24hWeight = 0.3;
+      const high24hWeight = 0.7;
       
       // Calculate blended score
       logger.debug('=== Blended Score Calculation ===');
-      logger.debug('Inputs - low24hScore:', low24hScore, 'high60mScore:', high60mScore);
-      logger.debug('Weights - low24hWeight:', low24hWeight, 'high60mWeight:', high60mWeight);
+      logger.debug('Inputs - low24hScore:', low24hScore, 'high24hScore:', high24hScore);
+      logger.debug('Weights - low24hWeight:', low24hWeight, 'high24hWeight:', high24hWeight);
       
-      const blendedScore = (low24hScore * low24hWeight) + (high60mScore * high60mWeight);
+      const blendedScore = (low24hScore * low24hWeight) + (high24hScore * high24hWeight);
       logger.debug('Raw blended score:', blendedScore);
       
       // Ensure score is within bounds and round to 1 decimal
       const finalScore = Math.round(Math.max(0, Math.min(10, blendedScore)) * 10) / 10;
       logger.debug('Final blended score (bounded and rounded):', finalScore);
       
-      // Prepare result object
-      const result = {
+      return {
         score: finalScore,
-        low24hScore: Math.round(low24hScore * 10) / 10,
-        high60mScore: Math.round(high60mScore * 10) / 10,
-        percentBelow60mHigh: Math.round(percentBelow60mHigh * 100) / 100,
-        weights: {
-          low24h: Math.round(low24hWeight * 100),
-          high60m: Math.round(high60mWeight * 100)
-        },
-        reasons: [
-          `24h Low Score: ${(Math.round(low24hScore * 10) / 10)}/10`,
-          `60m High Score: ${(Math.round(high60mScore * 10) / 10)}/10 (${percentBelow60mHigh >= 0 ? Math.round(percentBelow60mHigh * 100) / 100 + '% below' : 'New high'})`,
-          `Blended Score: ${finalScore}/10 (${Math.round(low24hWeight * 100)}% 24h Low, ${Math.round(high60mWeight * 100)}% 60m High)`
-        ],
+        low24hScore,
+        high24hScore,
+        percentBelow24hHigh,
+        low24hWeight,
+        high24hWeight,
         timestamp: new Date().toISOString()
       };
       
-      logger.debug('=== Final Blended Score Result ===');
-      logger.debug(JSON.stringify(result, null, 2));
-      logger.debug(`=== calculateBlendedScore COMPLETE (${Date.now() - startTime}ms) ===\n`);
-      
-      return result;
-      
     } catch (error) {
-      logger.error(`Error in calculateBlendedScore: ${error.message}`, { 
-        currentPrice,
-        error: error.stack 
-      });
-      
+      logger.error(`Error in calculateBlendedScore: ${error.message}`, { error });
       return {
         score: 0,
-        reasons: [`Error in blended score calculation: ${error.message}`],
+        error: error.message,
         timestamp: new Date().toISOString()
       };
     }
@@ -3104,19 +3056,12 @@ class SyrupTradingBot {
         throw new Error('Invalid or missing low24hScoreRanges configuration');
       }
       
-      // Find the appropriate score based on the configured ranges
-      let score = 0;
-      let scoreRange = '>5%';
-      
-      for (const range of this.buyConfig.low24hScoreRanges) {
-        if (range && typeof range.maxPercent === 'number' && 
-            typeof range.score === 'number' && 
-            percentAbove24hLow <= range.maxPercent) {
-          score = range.score;
-          scoreRange = range.maxPercent === Infinity ? '>5%' : `≤${range.maxPercent}%`;
-          break;
-        }
-      }
+      // Granular linear scoring: 0-10 pts where 10 = at/under 24h low, losing 1 point per 1% above low
+      // e.g. 0%-1% above -> 9 pts, 5% above -> 5 pts, ≥10% above -> 0 pts
+      let score = 10 - percentAbove24hLow;
+      if (percentAbove24hLow < 0) score = 10; // price below low gets max
+      score = Math.max(0, Math.min(10, score));
+      const scoreRange = `${percentAbove24hLow.toFixed(2)}% above low`;
       
       // Format values safely for display
       const formatValue = (value, decimals = 6) => {
@@ -3858,6 +3803,13 @@ class SyrupTradingBot {
     // Calculate dip score based on 60m high
     const dipScore = this.calculateDipScore(currentPrice) || { score: 0 };
     
+    // Refresh hourly candles to keep 24h calculations current
+    try {
+      await this.updateHourlyCandles(true); // force refresh so 24h high/low use latest data
+    } catch (e) {
+      logger.warn('Failed to refresh hourly candles for 24h metrics:', e.message);
+    }
+
     // Get 24h low score
     let low24hScore;
     try {
@@ -3872,10 +3824,13 @@ class SyrupTradingBot {
         percentAbove24hLow: 0
       };
     }
-    
-    // Calculate high60mInfo and blended score
-    const high60mInfo = await this.calculate60mHighPrice(currentPrice);
-    const blendedScoreResult = await this.calculateBlendedScore(currentPrice, low24hScore, high60mInfo) || { score: 0 };
+    const high12hInfo        = await this.calculate12hHighPrice(currentPrice);
+    const high24hInfo       = await this.calculate24hHighPrice(currentPrice);
+    const blendedScoreResult = await this.calculateBlendedScore(
+      currentPrice,
+      low24hScore,
+      high24hInfo
+    ) || { score: 0 };
     
     // Scale blended score to 0-3 points (14.3% of total 21 points)
     const blendedScoreValue = Math.min(3, (blendedScoreResult.score / 10) * 3);
@@ -4086,7 +4041,7 @@ class SyrupTradingBot {
         name: '4. Blended', 
         value: blendedScoreComponent, 
         max: 4,
-        description: '24h low/60m high price analysis'
+        description: '24h low / 24h high price analysis'
       }
     ];
 
@@ -4147,9 +4102,9 @@ class SyrupTradingBot {
     });
     
     // Log the blended score components for transparency
-    logger.info(`📊 Blended Score Components (24h Low: ${blendedScoreResult.low24hScore.toFixed(1)} | 60m High: ${blendedScoreResult.high60mScore.toFixed(1)})`);
+    logger.info(`📊 Blended Score Components (24h Low: ${blendedScoreResult.low24hScore.toFixed(1)} | 24h High: ${blendedScoreResult.high24hScore.toFixed(1)})`);
     logger.info(`   - 24h Low: ${blendedScoreResult.low24hScore.toFixed(1)}/10 (${low24hScore.percentAbove24hLow?.toFixed(2) || '0.00'}% above 24h low)`);
-    logger.info(`   - 60m High: ${blendedScoreResult.high60mScore.toFixed(1)}/10 (${blendedScoreResult.percentBelow60mHigh?.toFixed(2) || '0.00'}% below 60m high)`);
+    logger.info(`   - 24h High: ${blendedScoreResult.high24hScore.toFixed(1)}/10 (${blendedScoreResult.percentBelow24hHigh?.toFixed(2) || '0.00'}% below 24h high)`);
     logger.info(`   - Blended: ${blendedScoreResult.score.toFixed(1)}/10 (${(blendedScoreResult.score * 10).toFixed(1)}% of max)`);
     
     // Ensure total score is within 0-21 bounds
@@ -4201,7 +4156,7 @@ class SyrupTradingBot {
       
       if (blendedScoreResult) {
         logger.info(`  • 24h Low:  ${formatDecimal(blendedScoreResult.low24hScore || 0, 2)}/10`);
-        logger.info(`  • 60m High: ${formatDecimal(blendedScoreResult.high60mScore, 2)}/10`);
+        logger.info(`  • 24h High: ${formatDecimal(blendedScoreResult.high24hScore, 2)}/10`);
         logger.info(`  • Blended:  ${formatDecimal(blendedScoreResult.score, 2)}/10`);
       }
       
@@ -4316,11 +4271,8 @@ class SyrupTradingBot {
     const meetsThreshold = totalScore >= buyThreshold; // Using the 12/21 threshold consistently
     
     // Calculate all price metrics needed for logging
-    const high24hInfo = await this.calculate24hHighPrice(currentPrice);
-    const high12hInfo = await this.calculate12hHighPrice(currentPrice);
     const low24hScoreResult = await this.calculate24hLowScore(currentPrice);
-    // Reuse the high60mInfo that was already calculated at the start of the method
-    const blendedScore = await this.calculateBlendedScore(currentPrice, low24hScoreResult, high60mInfo);
+    const blendedScore = await this.calculateBlendedScore(currentPrice, low24hScoreResult, high24hInfo);    
     
     // Log detailed price metrics and scoring information
     if (totalScore >= this.buyConfig.minScore || logger.level === 'debug') {
@@ -4335,7 +4287,7 @@ class SyrupTradingBot {
       };
       
       logger.info(`- Current: $${formatDecimal(currentPrice)}`);
-      if (high60mInfo?.high60m) logger.info(formatPriceLevel(high60mInfo, '60m High'));
+      
       if (high12hInfo?.high12h) logger.info(formatPriceLevel(high12hInfo, '12h High'));
       if (high24hInfo?.avgHigh24h) logger.info(formatPriceLevel({ avgHigh24h: high24hInfo.avgHigh24h }, '24h High'));
       
@@ -4350,13 +4302,13 @@ class SyrupTradingBot {
       // Log blended score details if available
       if (blendedScore) {
         logger.info('\n🔄 BLENDED SCORE:');
-        const totalBlended = (blendedScore.low24hScore || 0) + (blendedScore.high60mScore || 0);
+        const totalBlended = (blendedScore.low24hScore || 0) + (blendedScore.high24hScore || 0);
         if (totalBlended > 0) {
           const low24hWeight = (blendedScore.low24hScore / totalBlended * 100).toFixed(1);
-          const high60mWeight = (blendedScore.high60mScore / totalBlended * 100).toFixed(1);
+          const high24hWeight = (blendedScore.high24hScore / totalBlended * 100).toFixed(1);
           logger.info(`- Score: ${formatDecimal(blendedScore.score, 2)}/10`);
           logger.info(`- 24h Low: ${formatDecimal(blendedScore.low24hScore, 2)} (${low24hWeight}% weight)`);
-          logger.info(`- 60m High: ${formatDecimal(blendedScore.high60mScore, 2)} (${high60mWeight}% weight)`);
+          logger.info(`- 24h High: ${formatDecimal(blendedScore.high24hScore, 2)} (${high24hWeight}% weight)`);
         }
         
         if (blendedScore.reasons?.length) {
@@ -6025,7 +5977,6 @@ class SyrupTradingBot {
         // Start the trailing stop manager but DO NOT await it.
         // This allows it to run in the background without blocking the main trading loop.
         logger.info('🚀 [TRAILING STOP] Starting trailing stop manager in the background...');
-        this.trailingStop.start(); // No 'await' here
 
         logger.info('✅ [TRAILING STOP] Trailing stop manager started successfully');
 
