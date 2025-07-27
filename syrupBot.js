@@ -6218,24 +6218,43 @@ class SyrupTradingBot {
       // Log raw account data for debugging
       logger.debug('Raw account data:', JSON.stringify(accounts, null, 2));
       
+      // Attempt to resolve portfolioId on first run using configured name
+      if (!this.portfolioId && this.coinbaseConfig?.portfolioName) {
+        const matching = accounts.find(acc => acc.portfolio_name === this.coinbaseConfig.portfolioName);
+        if (matching && matching.portfolio_id) {
+          this.portfolioId = matching.portfolio_id;
+          logger.info(`💼 Using portfolio '${this.coinbaseConfig.portfolioName}' (id: ${this.portfolioId})`);
+        } else {
+          logger.warn(`Portfolio '${this.coinbaseConfig.portfolioName}' not found in account list`);
+        }
+      }
+
       // Filter for configured base and quote currency accounts
       const filteredAccounts = {};
       const foundCurrencies = [];
       
       for (const account of accounts) {
+        // If a specific portfolio is configured, skip accounts from other portfolios
+        if (this.portfolioId && account.portfolio_id && account.portfolio_id !== this.portfolioId) {
+          continue;
+        }
         if ([this.baseCurrency, this.quoteCurrency].includes(account.currency)) {
           // Try different property names for balance, including EurBalance for USDC
-          const availableBalance = 
-            (account.currency === 'USDC' && account.EurBalance) ? account.EurBalance :
-            account.available_balance?.value || 
-            account.available_balance || 
-            account.balance?.available || 
+          // Prefer Advanced Trade fields first
+          const availableBalance =
+            account.available_balance?.value ??
+            account.available_balance ??
+            account.available ??
+            account.balance?.available ??
+            account.balance?.value ??
             '0';
           
-          const holdBalance = 
-            account.hold?.value || 
-            account.hold || 
-            account.balance?.hold || 
+          const holdBalance =
+            account.hold_balance?.value ??
+            account.hold_balance ??
+            account.hold?.value ??
+            account.hold ??
+            account.balance?.hold ??
             '0';
           
           // Parse and validate the balance values
@@ -6247,18 +6266,20 @@ class SyrupTradingBot {
             continue;
           }
           
-          // Format the balance based on currency type
-          const formattedAvailable = this.formatPrice(available, account.currency);
+          // Calculate totals and format
+          const total = available + hold;
+          const formattedAvailable = this.formatPrice(total, account.currency); // use total
           const formattedHold = this.formatPrice(hold, account.currency);
+          const formattedTotal = this.formatPrice(total, account.currency);
           
           filteredAccounts[account.currency] = {
-            available: formattedAvailable,
-            balance: formattedAvailable, // Using available as the main balance
-            hold: formattedHold
+            available: formattedTotal, // expose total as available for simplicity
+            hold: formattedHold,
+            balance: formattedTotal
           };
           
           foundCurrencies.push(account.currency);
-          logger.debug(`Processed account ${account.currency}: available=${formattedAvailable}, hold=${formattedHold}`);
+          logger.debug(`Processed account ${account.currency}: total=${formattedTotal} (available ${this.formatPrice(available, account.currency)}, hold ${formattedHold})`);
         }
       }
       
